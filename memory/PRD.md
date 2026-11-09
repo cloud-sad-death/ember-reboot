@@ -18,6 +18,12 @@ Ember: a native, GPU-rendered macOS terminal (daily driver) that runs the user's
 - The terminal engine is alacritty_terminal, not libghostty (libghostty embedding is macOS/Xcode-only and cannot be built here). It sits behind TerminalView, so it can be swapped.
 - UI look and feel is unverified until macOS CI runs (needs GitHub connected) or the user tries it on their Mac.
 
+## CI fix (2026-06)
+- Root cause of empty GitHub Actions tab: workflow was at `ember/.github/workflows/macos.yml` but repo root is `/app`. GitHub only discovers workflows at `<root>/.github/workflows/`.
+- Fix: moved workflow to `/app/.github/workflows/macos.yml` with `defaults.run.working-directory: ember`, `Swatinem/rust-cache` `workspaces: ember`, and artifact paths `ember/dist/Ember.dmg`, `ember/bench.txt`, `ember/shot-*.png`. Nested `ember/.github` removed.
+- Target: Apple Silicon only (macos-14 runner is arm64). Local validation: core tests pass, ember-cli builds, `bench` runs. ember-app (GPUI/Metal) compile only verifiable on the Mac runner.
+- Note: `ember/Cargo.lock` is untracked; committing it improves build reproducibility.
+
 ## Backlog
 - P0: push to GitHub → CI .dmg + screenshots; fix macOS compile/visual issues.
 - P0: swap in libghostty (or keep alacritty if it is fast enough).
