@@ -123,7 +123,12 @@ fn standard_mode_loops_and_config() {
     let f = s.rows.iter().find(|r| r.header == "false").unwrap();
     assert_eq!(f.rc, Some(1));
     assert!(s.rows.iter().filter(|r| r.kind == RowKind::Item).all(|r| r.rc == Some(0)));
-    assert!(s.rows.iter().all(|r| r.cwd == home.path().display().to_string()));
+    let expected_cwd = std::fs::canonicalize(home.path()).unwrap().display().to_string();
+    assert!(
+        s.rows.iter().all(|r| r.cwd == expected_cwd),
+        "cwd mismatch: expected {expected_cwd:?}, got {:?}",
+        s.rows.iter().map(|r| r.cwd.clone()).collect::<Vec<_>>()
+    );
 }
 
 #[test]

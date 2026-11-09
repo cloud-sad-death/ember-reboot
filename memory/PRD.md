@@ -23,6 +23,7 @@ Ember: a native, GPU-rendered macOS terminal (daily driver) that runs the user's
 - Fix: moved workflow to `/app/.github/workflows/macos.yml` with `defaults.run.working-directory: ember`, `Swatinem/rust-cache` `workspaces: ember`, and artifact paths `ember/dist/Ember.dmg`, `ember/bench.txt`, `ember/shot-*.png`. Nested `ember/.github` removed.
 - Target: Apple Silicon only (`macos-15` runner, arm64; `macos-14` was retired by GitHub on 2026-11-02). Local validation: core tests pass, ember-cli builds, `bench` runs. ember-app (GPUI/Metal) compile only verifiable on the Mac runner.
 - Note: `ember/Cargo.lock` is untracked; committing it improves build reproducibility.
+- macOS CI test fix: `pty_zsh.rs` cwd assertion now canonicalizes `home.path()` (macOS resolves tempdirs through `/var`→`/private/var`; was comparing raw vs resolved). No-op on Linux. Also `runs-on: macos-15`, `checkout@v5`.
 
 ## Backlog
 - P0: push to GitHub → CI .dmg + screenshots; fix macOS compile/visual issues.
