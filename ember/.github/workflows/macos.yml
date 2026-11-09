@@ -1,0 +1,46 @@
+name: macos
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Core tests (real zsh in a PTY)
+        run: cargo test -p ember-core -- --test-threads=1
+      - name: Build
+        run: cargo build --release -p ember-app -p ember-cli
+      - name: Benchmark
+        run: |
+          EMBER_DATA=$RUNNER_TEMP/bench ./target/release/ember-cli bench --mb 4096 | tee bench.txt
+      - name: Bundle Ember.app and .dmg
+        run: ./scripts/bundle-macos.sh
+      - name: Screenshots
+        continue-on-error: true
+        run: |
+          EMBER_DATA=$RUNNER_TEMP/shots EMBER_DEMO=1 ./dist/Ember.app/Contents/MacOS/ember &
+          sleep 12
+          screencapture -x shot-terminal.png || true
+          kill %1 || true
+          EMBER_DATA=$RUNNER_TEMP/shots EMBER_DEMO=report ./dist/Ember.app/Contents/MacOS/ember &
+          sleep 10
+          screencapture -x shot-report.png || true
+          kill %1 || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ember-dmg
+          path: dist/Ember.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-results
+          path: |
+            bench.txt
+            shot-*.png

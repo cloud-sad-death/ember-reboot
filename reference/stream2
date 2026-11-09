@@ -1,0 +1,1415 @@
+#!/bin/zsh
+# [2026-11-08 PST] stream2: mb7 template pass (fonts, header contrast/spacing, dates, TOC, search icon, bottom space, monochrome glow thumb, single-layer config). Logic unchanged.
+# [2026-10-30 PDT] monoblock template (approved v4 mockups + v5 globals): template/CSS/HTML rendering only;
+# prompt, banner, path printout, discovery and parsing unchanged. Accent selector commented out, not deleted.
+# [2026-10-27 PDT] blast25: rev6 report template with live append. Each command (or loop item) streams into
+# its row as it runs. Rotation = plp-h: whole rows, ~20 MB erring over, never early into a near-empty part.
+# blast25s: a row still streaming when the open part would pass 30 MB is split at a line break, the part is
+# closed, and the same row (same header) continues in the next part. A closed part is final. Ctrl-C/exit closes
+# the open part.
+# No temp files: output reaches the terminal and the report through pipes (coprocs), not a fifo + output file.
+# [2026-10-24 PDT] blast24: consistent host pills, optional editable description, report-only configuration.
+# [2026-10-24 PDT] blast23: concat27 presentation, bounded indentation, local edit timestamps, automatic deletion export, five-column sidebar parts; rotate after target.
+# [2026-10-24 PDT] blast22: concat22 report; ordinary loops admitted; preamble retained with first item.
+# [2026-10-20 PDT] blast21 adopts concat20 HTML, grouped index, Config metadata,
+# copy/fold/save controls, live complete documents and whole-artifact rotation.
+# Existing execution, loop splitting, terminal tee, naming and JSON fields retained.
+# 2026-09-30: v2 unifies command output; reads are no longer separate cards.
+# 2026-09-30: blast20 report polish; v2 command capture preserved.
+# 2026-09-29: conservative blast19 cleanup. Original report frontend retained.
+# One zsh executes commands directly. tee only copies bytes; no PTY or polling.
+if [[ $ZSH_EVAL_CONTEXT == *:file* ]]; then
+  print -u2 'Run this script instead of sourcing it.'
+  return 1
+fi
+# Save terminal modes before user configuration; restore them on exit.
+B19_TTY_ORIGINAL=""
+if [[ -t 0 && -t 1 ]]; then
+  B19_TTY_ORIGINAL=$(stty -g </dev/tty)
+fi
+trap '[[ -n $B19_TTY_ORIGINAL ]] && stty "$B19_TTY_ORIGINAL" </dev/tty' EXIT
+exec {B19_STDOUT}>&1 {B19_STDERR}>&2
+B19_ACTIVE=0
+B19_TEE_PID=""
+B19_CAPTURE_FD=""
+B19_WORK=""
+B19_INTERRUPTED=0
+B19_READING=0
+# zsh reads .zshenv once at startup; load .zshrc once, never once per command.
+# CAST_NO_RC=1 gives tests and batch use a clean environment.
+if [[ ${CAST_NO_RC:-0} != 1 && -r ${CAST_RC:-$HOME/.zshrc} ]]; then
+  source "${CAST_RC:-$HOME/.zshrc}" >/dev/null 2>&1
+fi
+B19_ALIAS_OPTION=$options[aliases]
+unsetopt nounset bgnice aliases
+# LF must return to column zero, even if configuration turned ONLCR off.
+if [[ -n $B19_TTY_ORIGINAL ]]; then
+  stty "$B19_TTY_ORIGINAL" </dev/tty
+  stty opost onlcr </dev/tty
+fi
+umask 022
+LC_ALL=${LC_ALL:-en_US.UTF-8}
+
+# ── autodest naming ────────────────────────────────────────────────────
+SCRIPT_NAME=$(basename "$0" .sh)
+SCRIPT_PATH=$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")
+
+# BEGIN REPORT CONFIG — editable report controls only
+ROTATE_BYTES="${CAST_ROTATE_BYTES:-20000000}"  # Complete items cross 20 MB; next item rotates.
+REPORT_SETTINGS=$(cat <<'BLAST_REPORT_SETTINGS'
+{
+  "output_font_px": 13,
+  "output_line_height": 1.8,
+  "row_font_px": 14,
+  "timestamp_font_px": 13,
+  "toc_font_px": 13,
+  "maximum_indent_percent": 25,
+  "part_columns": 5,
+  "part_button_width_px": 48,
+  "part_button_height_px": 40,
+  "scroll_duration_ms": 220,
+  "output_block_chars": 32768,
+  "collapse_outputs_initially": false
+}
+BLAST_REPORT_SETTINGS
+)
+# END REPORT CONFIG
+
+# Runtime facts and universal plumbing; these are not report configuration.
+HOSTNAME_S=$(hostname -s 2>/dev/null || hostname)
+HOSTNAME_FULL=$(hostname 2>/dev/null)
+FX_ROOT="${CAST_ROOT:-$HOME/fx/$SCRIPT_NAME}"
+SHELL_BIN="/bin/zsh"
+CUR_DIR="$PWD"
+B21_START_DIR="$PWD"
+REPORT_DESCRIPTION="${CAST_DESCRIPTION-}"
+mkdir -p "$FX_ROOT" || { echo "$SCRIPT_NAME: cannot create $FX_ROOT" >&2; exit 1; }
+
+command -v python3 >/dev/null || { print -u2 'python3 is required'; exit 1; }
+case "$ROTATE_BYTES" in ''|*[!0-9]*) print -u2 'CAST_ROTATE_BYTES must be an integer'; exit 1 ;; esac
+if (( ROTATE_BYTES < 32768 )); then
+  print -u2 'CAST_ROTATE_BYTES must be at least 32768 bytes'
+  exit 1
+fi
+
+# ── header system fields ──────────────────────────────────────────────
+SYS_USER=$(whoami 2>/dev/null)
+SYS_OS_NAME=$(sw_vers -productName 2>/dev/null)
+SYS_OS_VERSION=$(sw_vers -productVersion 2>/dev/null)
+SYS_OS_BUILD=$(sw_vers -buildVersion 2>/dev/null)
+SYS_HW_INFO=$(system_profiler -detailLevel mini SPHardwareDataType 2>/dev/null)
+SYS_MODEL_NAME=$(printf '%s\n' "$SYS_HW_INFO" | awk -F': ' '/Model Name:/{print $2; exit}')
+SYS_MODEL_ID=$(printf '%s\n' "$SYS_HW_INFO" | awk -F': ' '/Model Identifier:/{print $2; exit}')
+SYS_MODEL_NUMBER=$(printf '%s\n' "$SYS_HW_INFO" | awk -F': ' '/Model Number:/{print $2; exit}')
+SYS_CHIP=$(printf '%s\n' "$SYS_HW_INFO" | awk -F': ' '/Chip:/{print $2; exit}')
+
+SYS_MEMORY=$(printf '%s\n' "$SYS_HW_INFO" | awk -F': ' '/Memory:/{print $2; exit}')
+SYS_FIRMWARE=$(printf '%s\n' "$SYS_HW_INFO" | awk -F': ' '/System Firmware Version:/{print $2; exit}')
+
+TS_FILE=$(date "+%m.%d.%y_%I.%M%p" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+[ -z "$TS_FILE" ] && TS_FILE=$(date "+%Y%m%d_%H%M%S")
+# Human-readable timestamp shown inside the report header.
+TS_DISPLAY=$(date "+%B %d %Y %I:%M %p" 2>/dev/null | tr '[:lower:]' '[:upper:]')
+[ -z "$TS_DISPLAY" ] && TS_DISPLAY="$TS_FILE"
+BASE="${SCRIPT_NAME}_${HOSTNAME_S}_${TS_FILE}"
+# Keep blast19 names, adding a PID only when a same-minute report already exists.
+if [[ -e "$FX_ROOT/$BASE.html" || -e "$FX_ROOT/$BASE.json" ]]; then
+  BASE="${BASE}_$$"
+fi
+RUN_ID="${BASE}_$$"
+
+PART=1
+BLAST_FAVICON='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+Cgk8cGF0aCBmaWxsPSIjMDAwIiBkPSJNMiAyMC4zNVYxOC40cS43MjUgMCAxLjIzOC0uMjI1dDEuMDM3LS40ODh0MS4xNjMtLjQ3NVQ3LjAxMyAxN3QxLjU1LjIxM3QxLjEzNy40NzR0MS4wNS40ODhUMTIgMTguNHQxLjI1LS4yMjV0MS4wNS0uNDg4dDEuMTUtLjQ3NVQxNy4wMTMgMTd0MS41NjIuMjEzdDEuMTUuNDc0dDEuMDUuNDg4VDIyIDE4LjR2MS45NXEtLjk1IDAtMS41ODctLjIyNXQtMS4xNjMtLjQ4N3QtMS4wMjUtLjQ3NVQxNyAxOC45NXEtLjcgMC0xLjIxMy4yMTN0LTEuMDI1LjQ3NXQtMS4xNS40ODdUMTIgMjAuMzV0LTEuNjEzLS4yMjV0LTEuMTUtLjQ4N3QtMS4wMTItLjQ3NXQtMS4yMTMtLjIxM3QtMS4yMjUuMjEzdC0xLjAzNy40NzV0LTEuMTYzLjQ4N1QyIDIwLjM1bTAtNC40NXYtMS45NXEuNzI1IDAgMS4yMzctLjIyNXQxLjAzOC0uNDg3dDEuMTYyLS40NzV0MS41NzUtLjIxM3QxLjU1LjIxM3QxLjEzOC40NzV0MS4wNS40ODd0MS4yNS4yMjV0MS4yNS0uMjI1dDEuMDUtLjQ4N3QxLjE1LS40NzVUMTcgMTIuNTVxLjk1IDAgMS41NzUuMjEzdDEuMTUuNDc1dDEuMDUuNDg3VDIyIDEzLjk1djEuOTVxLS45NSAwLTEuNTg4LS4yMjV0LTEuMTYyLS40ODh0LTEuMDI1LS40NzRUMTcgMTQuNXQtMS4yMzcuMjEzdC0xLjAyNi40NzV0LTEuMTM3LjQ4N3QtMS42LjIyNXQtMS42MTItLjIyNXQtMS4xNS0uNDg4dC0xLjAxMy0uNDc0dC0xLjIxMi0uMjEzdC0xLjIyNS4yMTN0LTEuMDM4LjQ3NXQtMS4xNjIuNDg3VDIgMTUuOW0wLTQuNDVWOS41cS43MjUgMCAxLjIzOC0uMjI1dDEuMDM3LS40ODh0MS4xNjMtLjQ3NVQ3LjAxMyA4LjF0MS41NS4yMTN0MS4xMzcuNDc0dDEuMDUuNDg4VDEyIDkuNXQxLjI1LS4yMjV0MS4wNS0uNDg4dDEuMTUtLjQ3NVQxNyA4LjFxLjk1IDAgMS41NzUuMjEzdDEuMTUuNDc0dDEuMDUuNDg4VDIyIDkuNXYxLjk1cS0uOTUgMC0xLjU4Ny0uMjI1dC0xLjE2My0uNDg3dC0xLjAyNS0uNDc1VDE3IDEwLjA1cS0uNyAwLTEuMjEzLjIxM3QtMS4wMjUuNDc1dC0xLjE1LjQ4N1QxMiAxMS40NXQtMS42MTMtLjIyNXQtMS4xNS0uNDg3dC0xLjAxMi0uNDc1dC0xLjIxMy0uMjEzdC0xLjIyNS4yMTN0LTEuMDM3LjQ3NXQtMS4xNjMuNDg3VDIgMTEuNDVNMiA3VjUuMDVxLjcyNSAwIDEuMjM3LS4yMjV0MS4wMzgtLjQ4N3QxLjE2Mi0uNDc1dDEuNTc1LS4yMTN0MS41NS4yMTN0MS4xMzguNDc1dDEuMDUuNDg3VDEyIDUuMDV0MS4yNS0uMjI1dDEuMDUtLjQ4N3QxLjE1LS40NzVUMTcgMy42NXEuOTUgMCAxLjU3NS4yMTN0MS4xNS40NzV0MS4wNS40ODdUMjIgNS4wNVY3cS0uOTUgMC0xLjU4OC0uMjI1dC0xLjE2Mi0uNDg3dC0xLjAyNS0uNDc1VDE3IDUuNnEtLjcgMC0xLjIxMy4yMTN0LTEuMDI1LjQ3NXQtMS4xNS40ODdUMTIgN3QtMS42MTMtLjIyNXQtMS4xNS0uNDg4dC0xLjAxMi0uNDc0VDcuMDEyIDUuNnQtMS4yMjUuMjEzdC0xLjAzNy40NzV0LTEuMTYzLjQ4N1QyIDciIC8+Cjwvc3ZnPg=='   # rev6 favicon (blast24 had none)
+IFS= read -r -d '' BLAST_ENGINE_PY <<'BLAST_ENGINE_END'
+import sys, os, re, json, html, subprocess, shutil, platform, time
+from collections import Counter
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import quote
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
+DISPLAY_BLOCK_CHARS = 32_768     # browser rendering-block size inside one row; never rotation.
+STATS_DECK = r"""<div class="hdr-stats" aria-label="Report summary"><div class="kv"><span class="k">Source</span><span class="v path">@@SOURCE@@</span></div><div class="kv"><span class="k">Target</span><span class="v path">@@TARGET@@</span></div><div class="kv"><span class="k">Dirs</span><span class="v">@@DIRS@@</span></div><div class="kv"><span class="k">Files</span><span class="v">@@FILES@@</span></div><div class="kv"><span class="k">Types</span><span class="v">@@TYPES@@</span></div></div>
+"""
+def run(args,timeout=DEFAULT_COMMAND_TIMEOUT_SECONDS):
+    p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
+    if p.returncode: raise ValueError(p.stderr.decode('utf-8','replace').strip() or f'exited {p.returncode}')
+    return p.stdout.decode('utf-8','replace')
+
+def display_date(now):
+    months=('January February March April May June July August September October November December').split()
+    return f'{months[now.month-1]} {now.day} {now.year}'
+
+def display_time(now):
+    return f'{now.hour%12 or 12:02d}:{now.minute:02d} {"AM" if now.hour<12 else "PM"}'
+
+def terminal_path(path):
+    """Double-quoted, pasteable zsh path with shell-active characters escaped."""
+    value=str(path).replace('\\','\\\\').replace('"','\\"').replace('$','\\$').replace('`','\\`')
+    return '"'+value+'"'
+
+def terminal_box(lines,expand=False):
+    lines=[str(value) for value in lines]
+    width=max(40,shutil.get_terminal_size((80,24)).columns)
+    if expand and lines: width=max(width,max(len(value) for value in lines)+6)
+    inside=width-6
+    print('╔'+'═'*(width-2)+'╗')
+    for value in lines:
+        chunks=[value[i:i+inside] for i in range(0,len(value),inside)] or ['']
+        for chunk in chunks: print('║  '+chunk+' '*(inside-len(chunk))+'  ║')
+    print('╚'+'═'*(width-2)+'╝')
+
+def host_info(zsh_version):
+    """Script-independent host chips, in the original template's order."""
+    def query(*args):
+        try: return run(list(args)).strip()
+        except Exception: return ''
+    if platform.system()=='Darwin':
+        try: hardware=json.loads(query('/usr/sbin/system_profiler','SPHardwareDataType','-json'))['SPHardwareDataType'][0]
+        except (ValueError,KeyError,IndexError): hardware={}
+        model=query('/usr/sbin/sysctl','-n','hw.model') or hardware.get('machine_model','Unknown')
+        chip=hardware.get('chip_type') or query('/usr/sbin/sysctl','-n','machdep.cpu.brand_string') or 'Unknown'
+        memory=hardware.get('physical_memory','')
+        if not memory:
+            size=query('/usr/sbin/sysctl','-n','hw.memsize')
+            if size.isdigit(): memory=f'{int(size)/1024**3:g}GB'
+        hostname=query('/bin/hostname') or platform.node() or 'Unknown'
+        firmware=hardware.get('boot_rom_version') or hardware.get('system_firmware_version','')
+        if not firmware:
+            mini=query('/usr/sbin/system_profiler','SPHardwareDataType','-detailLevel','mini')
+            match=re.search(r'^\s*System Firmware Version:\s*(.+?)\s*$',mini,re.M)
+            if match: firmware=match.group(1)
+        # [2026-10-25 PDT] MEMORY = '<chip> <size>' (e.g. 'Apple M5 24GB'); HOSTNAME label is HOST.
+        memory=' '.join(filter(None,[chip,re.sub(r'(\d)\s+(GB|TB|MB)\b',r'\1\2',memory)]))
+        return [('macOS',' '.join(filter(None,[query('/usr/bin/sw_vers','-productVersion'),query('/usr/bin/sw_vers','-buildVersion')]))),
+                ('MODEL',' '.join(filter(None,[model,hardware.get('model_number','')])) or 'Unknown'),
+                ('MEMORY',memory or 'Unknown'), ('HOST',hostname),
+                ('System Firmware Version',firmware or 'Unknown'), ('ZSH',zsh_version)]
+    try: memory=f'{round(os.sysconf("SC_PHYS_PAGES")*os.sysconf("SC_PAGE_SIZE")/1024**3):g}GB'
+    except (ValueError,OSError): memory=''
+    cpu=''
+    try:
+        match=re.search(r'^model name\s*:\s*(.+?)\s*$',Path('/proc/cpuinfo').read_text(errors='replace'),re.M)
+        if match: cpu=match.group(1)
+    except OSError: pass
+    memory=' '.join(filter(None,[cpu or platform.processor() or platform.machine(),memory]))
+    return [(platform.system(),platform.release()),('MODEL',platform.machine() or 'Unknown'),
+            ('MEMORY',memory or 'Unknown'),
+            ('HOST',platform.node() or 'Unknown'),('System Firmware Version','Unknown'),('ZSH',zsh_version)]
+
+def display_blocks(text):
+    if len(text)<=DISPLAY_BLOCK_CHARS: return html.escape(text)
+    blocks=[];start=0
+    while start<len(text):
+        end=min(len(text),start+DISPLAY_BLOCK_CHARS)
+        if end<len(text):
+            newline=text.rfind('\n',start,end)
+            if newline>start: end=newline+1
+        blocks.append('<span class="render-block">'+html.escape(text[start:end])+'</span>')
+        start=end
+    return ''.join(blocks)
+
+REVERSE_DNS_ROOTS = {'edu', 'net', 'dev', 'gov', 'de', 'co', 'org', 'me', 'com', 'uk', 'app', 'io'}
+PLP_FILENAMES = {'coderesources'}
+KNOWN_EXTENSIONS = ['.7z', '.a', '.aab', '.aac', '.apk', '.arrow', '.avi', '.avif', '.bmp', '.bz2', '.cer', '.cmd', '.crt', '.css', '.csv', '.db', '.der', '.dex', '.dll', '.dmg', '.doc', '.docx', '.dylib', '.epub', '.exe', '.fb2', '.feather', '.flac', '.gif', '.gz', '.h5', '.hdf', '.hdf5', '.heic', '.heif', '.htm', '.html', '.ipa', '.ipsw', '.iso', '.jar', '.jpeg', '.jpg', '.json', '.jxl', '.key', '.log', '.lzma', '.m4a', '.markdown', '.md', '.mkv', '.mobileprovision', '.mov', '.mp3', '.mp4', '.npy', '.npz', '.numbers', '.o', '.odp', '.ods', '.odt', '.ogg', '.org', '.otf', '.pages', '.parquet', '.pcap', '.pcapng', '.pdf', '.pickle', '.pkl', '.plist', '.png', '.pptx', '.pq', '.provisionprofile', '.py', '.rar', '.rst', '.rtf', '.rtfd', '.sh', '.so', '.sqlite', '.sqlite3', '.sys', '.tar', '.tbz', '.tbz2', '.tex', '.text', '.tgz', '.tif', '.tiff', '.ttc', '.ttf', '.txt', '.txz', '.war', '.wav', '.webarchive', '.webloc', '.webm', '.webp', '.woff', '.woff2', '.xlsx', '.xz', '.zip', '.zsh', '.zst']
+KNOWN_EXTENSIONS = set(KNOWN_EXTENSIONS)
+def type_name(path,reader=''):
+    name=path.name
+    if name.casefold()=='.ds_store': return 'dsstore'
+    if name.casefold() in PLP_FILENAMES: return name
+    # [2026-10-27 PDT] rev 6: type = the file's own extension, lowercased, read from the path string (zsh ${(L)f:e});
+    # a plp hit is not proof of a plist. No extension: known names keep their name, else 'unknown'.
+    ext=path.suffix.lower().lstrip('.')
+    if ext: return ext
+    return {'sqlite':'db','plist':'plist','text':'text'}.get(reader,'unknown')
+
+def format_counts(counts,limit=5):
+    top=sorted(counts.items(),key=lambda item:(-item[1],item[0]))[:limit]
+    return ', '.join(f'{kind} ({count})' for kind,count in top) or 'none'
+
+
+TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en" class="cast-root" data-accent="1A05A2">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>@@TITLE@@</title>
+<link rel="icon" type="image/svg+xml" href="@@FAVICON@@"/>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+
+:root {
+  --font-mono: 'JetBrains Mono Light', 'Cascadia Code Light', 'Roboto Mono Light';
+  --ink: #000000;
+  --paper: #ffffff;
+  
+  --accent: #FF8383; 
+  --gutter: 40px; 
+  --sidebar-w: 300px; 
+}
+
+[data-accent="FF8383"] { --accent: #FF8383; }
+[data-accent="FCD3FF"] { --accent: #FCD3FF; }
+[data-accent="29AA99"] { --accent: #29AA99; }
+[data-accent="15D8B3"] { --accent: #15D8B3; }
+[data-accent="7692FF"] { --accent: #7692FF; }
+[data-accent="1A05A2"] { --accent: #1A05A2; }
+
+a { text-decoration: none; color: inherit; }
+button { font-family: inherit; cursor: pointer; background: none; border: none; padding: 0; color: inherit; }
+input { font-family: inherit; }
+
+html.cast-root { background: var(--ink); }
+body {
+  min-height: 100vh;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  border: 8px solid var(--ink);
+}
+
+
+
+html { scrollbar-width: none; } 
+html::-webkit-scrollbar { display: none; } 
+
+aside::-webkit-scrollbar { width: 6px; }
+aside::-webkit-scrollbar-track { background: transparent; border-left: 0; }
+aside::-webkit-scrollbar-thumb { background: var(--ink); border: 0; min-height: 0; }
+
+
+.scroll-rail { position: fixed; top: 0; right: 16px; width: 14px; height: 100vh; pointer-events: auto; z-index: 2000; cursor: pointer; }
+.scroll-thumb { position: absolute; top: 0; left: 1px; right: 1px; min-height: 48px; border-radius: 6px; border: 2px solid var(--ink); cursor: grab; background: linear-gradient(180deg, var(--ink) 0%, var(--paper) 50%, var(--ink) 100%); background-size: 100% 300%; animation: thumb-slide 6s linear infinite; }
+@keyframes thumb-slide {
+  0% { background-position: 0% 0%; }
+  100% { background-position: 0% 100%; }
+}
+
+.icon { width: 18px; height: 18px; flex-shrink: 0; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: square; stroke-linejoin: miter; }
+
+
+/* [2026-10-19 PDT] Header (final2): identity row / framed context deck / toolbar row. Spacing only, no rules. */
+header { display: flex; flex-direction: column; gap: 28px; width: 100%; padding: 28px 0 16px; background: var(--ink); color: var(--paper); border-bottom: 6px solid var(--ink); }
+.hdr-top { display: grid; grid-template-columns: minmax(0, 1fr); align-items: center; gap: 14px 32px; width: 100%; padding: 0 var(--gutter); }
+.hdr-brand { grid-area: 1 / 1; display: flex; align-items: baseline; gap: 16px; min-width: 0; }
+.hdr-brand .icon { width: 32px; height: 32px; align-self: center; }
+.hdr-title { font-size: 34px; font-weight: 600; line-height: 1.15; letter-spacing: .03em; text-transform: none; overflow-wrap: break-word; min-width: 0; }
+.meta-time { display: flex; flex-wrap: wrap; column-gap: 2ch; grid-area: 1 / 1; justify-self: end; align-self: end; background: var(--paper); color: var(--ink); border: 2px solid var(--paper); padding: 10.8px 10px 7.8px; font-size: 17px; font-weight: 300; line-height: 1; letter-spacing: .02em; text-transform: uppercase; position: relative; top: -8.6px; } /* caps optically centred: line-height 1, asymmetric 10.8 / 7.8 (6px 10px feel; 39.6px tall); top:-8.6px puts the bottom border's outer edge on the target baseline (measured, 34px title) */
+.meta-time > span:first-child, .meta-time-spacer > span > span:first-child { font-weight: 600; }
+/* [2026-10-19 PDT] v2 title: small dim script label, baseline-aligned before the large target (no colon). */
+.hdr-script { margin-right: .7em; font-size: 14px; font-weight: 300; letter-spacing: .08em; text-transform: uppercase; color: var(--paper); }
+.hdr-target { overflow-wrap: anywhere; }
+.hdr-deck { display: flex; flex-direction: column; gap: 10px; margin: 0 var(--gutter); border: 2px solid var(--paper); padding: 16px; }
+.hdr-meta, .hdr-stats { display: flex; flex-wrap: wrap; align-items: stretch; gap: 10px; }
+.hdr-meta .kv { --pf: var(--ink); --pi: var(--paper); }
+.hdr-stats .kv { --pf: var(--paper); --pi: var(--ink); }
+.kv { display: flex; flex-direction: column; justify-content: center; gap: 2px; min-width: 0; max-width: 100%; background: var(--pf); color: var(--pi); border: 2px solid var(--paper); padding: 6px 10px; line-height: 1.3; }
+.kv .k { font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .1em; }
+.kv .v { font-size: 12px; font-weight: 300; overflow-wrap: anywhere; }
+.kv .v.path { word-break: break-all; }
+/* Title row: the date pill shares the title's grid cell, pinned bottom-right, so it sits on the title's
+   LAST line. An invisible copy at the end of the title text (.meta-time-spacer) reserves the pill's width
+   and height (39.6px = 17px x 1 + 10.8px + 7.8px + 2 x 2px border, centred on the title line) on that line; if the last line has no room, the spacer wraps and the pill drops below. */
+.meta-time-spacer { display: inline-block; visibility: hidden; margin-left: 32px; padding: calc((39.6px - 1.15em) / 2) 0; vertical-align: baseline; }
+.meta-time-spacer > span { display: inline-block; height: 0; overflow: hidden; padding: 0 12px; font-size: 17px; font-weight: 300; letter-spacing: .02em; text-transform: uppercase; vertical-align: baseline; }
+.meta-time-spacer > span > span + span { margin-left: 2ch; }
+/* Toolbar row: right edge = row icon cluster (row border 2px + row-hd padding 12px). */
+.hdr-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 20px; margin-top: -8px; padding: 0 calc(var(--gutter) + 14px) 0 var(--gutter); }
+
+
+main { display: flex; align-items: flex-start; width: 100%; background: var(--paper); }
+
+
+aside {
+  width: var(--sidebar-w, 300px); 
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  overflow-y: auto;
+  border-right: 3px solid var(--ink);
+  background: var(--paper);
+}
+.toc-search { width: 100%; border: 2px solid var(--ink); background: var(--paper); color: var(--ink); padding: 8px 12px; font-family: var(--font-mono); font-size: 13px; outline: none; }
+.toc-search::placeholder { color: var(--ink); }
+nav.toc { display: flex; flex-direction: column; gap: 8px; }
+nav.toc a { display: block; width: 100%; padding: 8px 12px; background: var(--paper); color: var(--ink); border: 2px solid var(--ink); font-size: 13px; font-weight: 300; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: background .12s, color .12s; }
+nav.toc a:hover { background: var(--ink); color: var(--paper); }
+nav.toc a.active { background: var(--ink); color: var(--paper); }
+
+/* [2026-10-04 PDT] Wrapped bottom grid: hover, focus, and current part are visible. */
+/* [2026-10-15 PDT] One centered, rigid grid: no gaps or recentered partial rows. */
+.parts { display:grid; grid-template-columns:repeat(var(--part-columns),48px); grid-auto-rows:40px; justify-content:center; gap:0; width:100%; padding:24px var(--gutter); border-top:3px solid var(--ink); background:var(--paper); }
+/* [2026-10-19 PDT] Each shared edge is drawn once: uniform 1px lines.
+   Rows remain rigid, gapless and capped at ten; all states are monochrome. */
+.parts a { display:flex; align-items:center; justify-content:center; width:48px; height:40px; padding:0; border:0; border-right:1px solid var(--ink); border-bottom:1px solid var(--ink); background:var(--paper); color:var(--ink); font-size:13px; font-weight:700; transition:background .12s,color .12s; box-shadow:none; outline:none; }
+.parts a:nth-child(-n+10) {border-top:1px solid var(--ink);}
+.parts a:nth-child(10n+1) {border-left:1px solid var(--ink);}
+.parts a:hover,.parts a:focus-visible {background:var(--ink);color:var(--paper);}
+.parts a.current {background:var(--ink);color:var(--paper);box-shadow:none;}
+.parts a.current:hover {background:var(--paper);color:var(--ink);}
+.render-block {display:block;content-visibility:auto;contain-intrinsic-size:auto 800px;}
+.row-output {content-visibility:auto;contain-intrinsic-size:auto 400px;}
+
+
+
+section.content { overflow-anchor:none; flex: 1 1 0%; min-width: 0; padding: var(--gutter); display: flex; flex-direction: column; gap: 24px; }
+
+.row { overflow-anchor:none; display: flex; flex-direction: column; background: var(--paper); border: 2px solid var(--ink); scroll-margin-top: 8px; }
+
+.icon-cluster { display: flex; flex-shrink: 0; gap: 2px; }
+.icon-cluster button { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; color: currentColor; transition: background .12s, color .12s; }
+.icon-cluster button:hover { background: var(--ink); color: var(--paper); }
+.row.active .icon-cluster button:hover { background: var(--paper); color: var(--ink); }
+.icon-cluster button.copied { background: var(--accent); color: var(--paper); }
+.row.active .icon-cluster button.copied { background: var(--accent); color: var(--paper); }
+.btn-del:hover { background: #c0392b !important; color: var(--paper) !important; }
+
+
+.row-output { display: block; }
+.out { padding: 20px 24px; font-family: var(--font-mono); font-size: 13px; line-height: 1.5; color: var(--ink); }
+.ln { display: block; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.out strong { font-weight: 700; color: var(--ink); }
+.out .v { color: var(--accent); }
+
+.out strong .v { color: inherit; }
+.raw { display: none; }
+
+
+/* [2026-10-19 PDT] Accent swatches parked small at the toolbar row's left; final home pending. */
+.accent-switcher { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; opacity: .8; }
+.accent-switcher__label { font-size: 10px; font-weight: 700; letter-spacing: .1em; color: var(--paper); margin-right: 4px; text-transform: uppercase; }
+.accent-dot { width: 14px; height: 14px; border: 2px solid var(--paper); border-radius: 0; cursor: pointer; transition: transform .12s; } 
+.accent-dot:hover { transform: scale(1.15); }
+.accent-dot.active { box-shadow: 0 0 0 2px var(--ink), 0 0 0 4px var(--paper); }
+
+
+.hdr-controls { display: flex; gap: 5px; margin-left: auto; }
+.hdr-controls button { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; color: var(--paper); transition: background .12s, color .12s; }
+.hdr-controls button:hover { background: var(--paper); color: var(--ink); }
+.hdr-controls .fold-ic { transition: transform .15s; }
+.hdr-controls button.collapsed .fold-ic { transform: rotate(-90deg); }
+
+
+.btn-fold { margin-left: 6px; }
+.btn-fold .fold-ic { transition: transform .15s; }
+.icon-cluster button.saved { background: var(--accent); color: var(--paper); }
+
+
+.row.collapsed .row-output { display: none; } 
+.row.collapsed .btn-fold .fold-ic { transform: rotate(-90deg); }
+
+
+.resizer { width: 6px; flex-shrink: 0; height: 100vh; position: sticky; top: 0; cursor: col-resize; background: var(--ink); }
+.resizer:hover, .resizer.dragging { background: var(--accent); }
+body.resizing { cursor: col-resize; user-select: none; }
+
+@media (max-width: 720px) {
+  main { display: block; }
+  aside { width: auto; height: auto; position: static; border-right: 0; border-bottom: 3px solid var(--ink); }
+  .resizer { display: none; } 
+}
+
+[hidden]{display:none!important}pre{font-family:inherit;font-size:inherit}
+body {font-weight:300; font-size:14px; line-height:1.75; letter-spacing:.015em}
+.out {font-size:14px;line-height:1.8;tab-size:4;letter-spacing:.015em}
+.icon-cluster {gap:5px}
+.icon-cluster button,.hdr-controls button {width:32px;height:32px}
+.resizer {width:10px;touch-action:none}.scroll-rail {touch-action:none}
+button:focus-visible,input:focus-visible,.resizer:focus-visible {outline:3px solid var(--accent);outline-offset:3px}
+dialog {margin:auto;padding:28px;max-width:90vw;border:3px solid black;font:inherit}
+dialog::backdrop {background:rgba(0,0,0,.35)}dialog button {padding:8px 16px;border:2px solid;margin:16px 8px 0 0}
+@media(prefers-reduced-motion:reduce){.scroll-thumb{animation:none}}
+/* [2026-10-19 PDT] Header breakpoints: whole pills wrap; date pill drops under the title as one unit. */
+@media(max-width:900px){:root{--gutter:24px}
+ /* [2026-10-19 PDT] v2 compact, below the locked 1280 layout: inline key/value pills, content-sized, tighter rhythm */
+ header{padding-top:22px;gap:18px}.hdr-bar{margin-top:-6px}
+ .hdr-title{font-size:28px}.hdr-brand .icon{width:28px;height:28px}
+ .meta-time{padding:7.8px 8px 5.9px;font-size:14px;top:-7.19px}.hdr-script{font-size:12px}
+ .meta-time-spacer{margin-left:20px;padding:max(0px,calc((31.7px - 1.15em) / 2)) 0}.meta-time-spacer>span{padding:0 10px;font-size:14px}
+ .hdr-deck{padding:12px;gap:8px}.hdr-meta,.hdr-stats{gap:6px}
+ .kv{display:block;padding:4px 8px;line-height:1.35}.kv .k{display:inline;margin-right:1ch}.kv .v{display:inline}.kv .v.path{word-break:break-all}}
+@media(max-width:560px){:root{--gutter:16px}header{padding-top:18px;gap:16px}.hdr-title{font-size:24px}.hdr-script{font-size:11px;margin-right:.6em}.hdr-brand .icon{width:24px;height:24px}.hdr-top{gap:10px}.meta-time{grid-area:2/1;justify-self:start;top:-.5px}.meta-time-spacer{display:none}.hdr-deck{padding:10px}.hdr-bar{column-gap:10px}.accent-switcher{gap:4px}.parts{grid-template-columns:repeat(var(--part-columns),minmax(0,1fr))}.parts a{width:auto}}
+
+/* [2026-10-26 PDT] condump/conprint UI = approved mock-final. Heroicons outline toolbars: 20px boxes, 4px gaps;
+   x and -/+ stroke 3, clipboards 1.5; global and row right edges aligned. */
+.icon.hi{width:20px;height:20px;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.btn-del .icon.hi,.btn-fold .icon.hi,.gfold .icon.hi,.hdr-controls button[title^="Delete"] .icon.hi{stroke-width:3}
+.icon-cluster,.hdr-controls{gap:4px}
+.icon-cluster button,.hdr-controls button{width:20px;height:20px}
+.btn-fold{margin-left:0}
+.row.collapsed .btn-fold .fold-ic,.hdr-controls button.collapsed .fold-ic{transform:none}
+.row:not(.collapsed) .btn-fold .pm-v,.gfold:not(.collapsed) .pm-v{display:none}
+.hdr-bar{padding-right:calc(var(--gutter) + 14px)}
+/* Pager: full-width bottom lane, square 40px cells, up to 20 per row, auto-fit, centered; ink/paper only (never accent). */
+.parts{display:grid;grid-template-columns:repeat(auto-fit,40px);grid-auto-rows:40px;justify-content:center;gap:0;
+ width:min(100%,calc(20*40px + 2*var(--gutter) + 1px));margin:0 auto;padding:24px var(--gutter) 24px calc(var(--gutter) + 1px);box-sizing:border-box;border-top:0}
+.parts-lane{border-top:3px solid var(--ink);background:var(--paper)}
+.parts a,.parts a:nth-child(n){width:auto;height:auto;margin:0 0 -1px -1px;border:1px solid var(--ink);background:var(--paper);color:var(--ink);font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+.parts a:hover,.parts a:focus-visible,.parts a.current,.parts a.current:hover{background:var(--ink);color:var(--paper)}
+/* [2026-10-26 PDT] Report block fixes.
+   1) Copy checkmark: same 20px box as the icon it replaces; header copy-all buttons get the same tick.
+      Status popup (.pop): fixed + pointer-events:none, so it never reflows the report. ok = accent, err = red.
+   2) Row header horizontal room: timestamp pill -> path 1ch -> 3ch; path -> toggle cluster 12px -> 12px + 1ch.
+      Space before the pill, line-2 alignment and all vertical metrics are condump's, unchanged. */
+.icon.hi.ck{stroke-width:2.5}
+.pop{position:fixed;z-index:3000;pointer-events:none;max-width:calc(100vw - 8px);padding:4px 10px;border:2px solid var(--ink);box-shadow:3px 3px 0 var(--ink);background:var(--accent);color:var(--ink);font-family:var(--font-mono);font-size:12px;font-weight:600;line-height:1.4;letter-spacing:.02em;white-space:normal;overflow-wrap:anywhere}
+[data-accent="1A05A2"] .pop.ok{color:var(--paper)}
+.pop.err{background:#c0392b;color:var(--paper)}
+/* [2026-10-27 PDT] rev 5 row = approved mock C5. Header = black strip (timestamp left, toggles right) over the path box,
+   one continuous 16px frame (2px row border + 14px padding; 16px strip->path; 2px rule + 14px under the path when open).
+   One-line strip = path box = 52px: 16 + 20px line + 16. Selected (.active, same logic as the TOC highlight) = inverted
+   (black strip/frame); every other row = white strip/frame, black text/icons, 2px inner outline on the path box.
+   No drop shadows. Toggles 5px apart; icon sizes/strokes unchanged. Output box unchanged. */
+.row-hd{display:block;padding:14px;border-bottom:2px solid var(--ink);background:var(--paper);color:var(--ink);position:sticky;top:0;z-index:2;font-size:14px;line-height:20px}
+.row.collapsed .row-hd{border-bottom:0}
+.row.active .row-hd{background:var(--ink);color:var(--paper)}
+.row-strip{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 10px 16px;cursor:pointer}
+.row-ts{font-size:14px;font-weight:300;line-height:20px;letter-spacing:.01em;white-space:nowrap}
+.row-strip .icon-cluster{gap:5px}
+.row-cmd{display:block;padding:16px 10px;background:var(--paper);color:var(--ink);box-shadow:inset 0 0 0 2px var(--ink);font-size:14px;font-weight:300;line-height:20px;letter-spacing:.01em;word-break:break-all;overflow-wrap:anywhere}
+.row.active .row-cmd{box-shadow:none}
+.parts-lane[data-pre]{display:none}
+/* [2026-10-27 PDT] rev 6: index search hit = accent highlight; the entry is shifted ('…' lead) so the hit is in view. */
+nav.toc a mark{background:var(--accent);color:var(--ink);padding:0}
+[data-accent="1A05A2"] nav.toc a mark{color:var(--paper)}
+.hdr-controls{gap:5px}.hdr-bar{padding-right:calc(var(--gutter) + 26px)}
+#nofiles:has(~ .row){display:none}
+/* [2026-10-27 PDT] blast25: blast's own pieces on the rev6 template (failed command = 4px row border; description). */
+.row.bad{border-width:4px}
+/* t82u description commented out:
+.edit-description{margin-left:auto;align-self:stretch;border:1px solid var(--paper);padding:6px 10px;color:var(--paper);font:inherit}
+.edit-description:hover{background:var(--paper);color:var(--ink)}
+.description-pill{width:100%}.description-pill .v{white-space:pre-wrap}
+#description-input{display:block;width:min(70vw,650px);font:inherit;padding:8px;margin-top:12px;border:2px solid var(--ink);color:var(--ink);background:var(--paper)}
+*/
+</style>
+<script>
+// [2026-11-08 PST] pristine copy of the page as delivered (before the TOC/layer build), so a delete can save a clean file.
+let __src='';document.addEventListener('DOMContentLoaded',()=>{__src='<!DOCTYPE html>\n'+document.documentElement.outerHTML;});
+'use strict';
+// [2026-10-04 PDT] Cache DOM handles. Scroll uses O(log n) reads and changes only two rows.
+let rowNodes=[],linkNodes=[];
+const rows=()=>rowNodes;const links=()=>linkNodes;
+const linkByTarget=new Map();
+function refreshNodes(){rowNodes=rowNodes.filter(r=>r.isConnected);linkNodes=linkNodes.filter(l=>l.isConnected);}
+// [2026-10-26 PDT] Status popup: fixed, anchored above (else below) the triggering control, clamped to the
+// viewport, pointer-events:none, auto-dismiss 1.2s. ok = accent fill; err = red. Replaces the in-flow #notice line.
+function notice(t,anchor,kind,rect){
+ const r=rect||(anchor&&anchor.isConnected?anchor.getBoundingClientRect():null);if(!r)return;
+ const p=document.createElement('div');p.className='pop '+(kind||'ok');p.setAttribute('role','status');p.setAttribute('aria-live','polite');p.textContent=t;document.body.append(p);
+ const w=p.offsetWidth,h=p.offsetHeight,vw=document.documentElement.clientWidth;
+ let top=r.top-h-6;if(top<4)top=r.bottom+6;
+ p.style.left=Math.max(4,Math.min(vw-w-4,r.left+r.width/2-w/2))+'px';p.style.top=top+'px';
+ setTimeout(()=>p.remove(),1200);
+}
+const CHECK='<svg class="icon hi ck" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m4.5 12.75 6 6 9-13.5"/></svg>';
+function flashCheck(btn){if(btn._icon===undefined)btn._icon=btn.innerHTML;btn.innerHTML=CHECK;btn.classList.add('copied');clearTimeout(btn._ck);btn._ck=setTimeout(()=>{btn.innerHTML=btn._icon;btn._icon=undefined;btn.classList.remove('copied');},900);}
+function grab(r){return {cmd:r.dataset.copyPath||r.querySelector('.row-cmd').textContent,out:r.querySelector('.ln').textContent};}
+function allCopyPaths(){const node=document.getElementById('all-copy-paths');if(!node)return rows().map(grab).map(g=>g.cmd);try{return JSON.parse(node.textContent);}catch(_){return rows().map(grab).map(g=>g.cmd);}}
+async function writeClip(text,btn){
+  try {
+    try {await navigator.clipboard.writeText(text);} catch(_){
+      const t=document.createElement('textarea');t.value=text;document.body.append(t);t.select();
+      const ok=document.execCommand('copy');t.remove();if(!ok)throw Error('Clipboard unavailable');
+    }
+    flashCheck(btn);notice('Copied.',btn,'ok');
+  } catch(e){notice('Copy failed. Select the output and copy manually.',btn,'err');}
+}
+function copyInput(b,e){const g=grab(b.closest('.row'));writeClip(e.shiftKey?g.cmd+'\n'+g.out:g.cmd,b);}
+function copyOutput(b,e){const g=grab(b.closest('.row'));writeClip(e.shiftKey?g.cmd+'\n'+g.out:g.out,b);}
+function copyAll(b,e,input){if(input&&!e.shiftKey){writeClip(allCopyPaths().join('\n'),b);return;}writeClip(rows().map(grab).map(g=>e.shiftKey?g.cmd+'\n'+g.out:g.out).join('\n\n'),b);}
+let pending=[],pendingAnchor=null,pendingRect=null;
+function deleteRows(items,anchor){if(!items.length)return;pending=items;pendingAnchor=anchor||null;pendingRect=anchor?anchor.getBoundingClientRect():null;document.getElementById('delete-question').textContent=`Delete ${items.length} entr${items.length===1?'y':'ies'} from this report? Source files are untouched.`;document.getElementById('delete-dialog').showModal();}
+function deleteRow(b){deleteRows([b.closest('.row')],b);}
+function syncFold(){const rs=rows(),all=rs.length>0&&rs.every(r=>r.classList.contains('collapsed'));
+  rs.forEach(r=>{const b=r.querySelector('.btn-fold'),open=!r.classList.contains('collapsed');b.setAttribute('aria-expanded',open);b.title=open?'Collapse output':'Expand output';});
+  const b=document.querySelector('.gfold');b.classList.toggle('collapsed',all);b.setAttribute('aria-expanded',!all);b.title=all?'Expand all outputs':'Collapse all outputs';
+}
+function toggleOutput(b){b.closest('.row').classList.toggle('collapsed');syncFold();update();}
+function toggleAllOutputs(){const collapse=rows().some(r=>!r.classList.contains('collapsed'));rows().forEach(r=>r.classList.toggle('collapsed',collapse));syncFold();update();}
+let divider,aside,rail,thumb,resizing=false;
+function width(w){w=Math.round(Math.max(180,Math.min(innerWidth-360,600,w)));document.documentElement.style.setProperty('--sidebar-w',w+'px');divider.setAttribute('aria-valuenow',w);if(document.getElementById('tocSearch').value)tocFilter();}
+let dragging=false,offset=0;
+let updateFrame=0,activeRow=null;
+function update(){if(!updateFrame)updateFrame=requestAnimationFrame(updateNow);}
+function updateNow(){
+  updateFrame=0;
+  const de=document.documentElement,h=innerHeight,total=de.scrollHeight,rs=rows();
+  const th=Math.max(48,Math.min(h,h*h/Math.max(h,total)));
+  let lo=0,hi=rs.length;
+  while(lo<hi){const mid=(lo+hi)>>1;if(rs[mid].getBoundingClientRect().top<=80)lo=mid+1;else hi=mid;}
+  let active=rs[Math.max(0,lo-1)]||null;
+  if(scrollY>0&&scrollY+h>=total-3)active=rs[rs.length-1]||null;
+  // All geometry reads precede writes, avoiding repeated forced layout on scroll.
+  thumb.style.display=total<=h?'none':'';thumb.style.height=th+'px';thumb.style.transform=`translateY(${total>h?scrollY/(total-h)*(h-th):0}px)`;
+  if(active!==activeRow){
+    if(activeRow){activeRow.classList.remove('active');const l=linkByTarget.get(activeRow.id);if(l){l.classList.remove('active');l.removeAttribute('aria-current');}}
+    activeRow=active;
+    if(active){active.classList.add('active');const l=linkByTarget.get(active.id);if(l){l.classList.add('active');l.setAttribute('aria-current','true');}}
+  }
+}
+function seek(e){const h=innerHeight,t=thumb.offsetHeight;window.scrollTo({top:Math.max(0,Math.min(1,(e.clientY-offset)/(h-t)))*(document.documentElement.scrollHeight-h),behavior:'instant'});}
+// [2026-11-08 PST] delete saves for real: the system Save dialog opens with this file's own name (pick the folder, replace it).
+// Browsers without a Save dialog API download it under the same name (no _edited suffix).
+async function saveEdited(html){
+ const name=decodeURIComponent(location.pathname.split('/').pop()||'report.html'),blob=new Blob([html],{type:'text/html;charset=utf-8'});
+ if(window.showSaveFilePicker){try{const h=await showSaveFilePicker({suggestedName:name,types:[{description:'HTML report',accept:{'text/html':['.html']}}]});const w=await h.createWritable();await w.write(blob);await w.close();}catch(e){}return;}
+ const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.style.display='none';document.body.append(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1500);
+}
+function saveReport(){
+ const clone=document.documentElement.cloneNode(true);clone.querySelectorAll('.pop').forEach(p=>p.remove());clone.querySelector('#tocSearch').value='';clone.querySelector('#tocNav').replaceChildren();clone.querySelector('#delete-dialog').removeAttribute('open');/* t82u description commented out: clone.querySelector('#description-dialog').removeAttribute('open'); */
+ const blob=new Blob(['<!DOCTYPE html>\n'+clone.outerHTML],{type:'text/html;charset=utf-8'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=document.title.replace(/[^\w.-]+/g,'_')+'_edited.html';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+// [2026-10-27 PDT] rev 5. Rows arrive straight inside section.content (no per-row scripts). On page open (also on a
+// still-running part: the parser reaches the file's current end) one pass registers the rows and builds the full-path TOC.
+// __u({...}) calls appended between rows update the Dirs/Files/Types pills and the pager in place.
+// [2026-10-27 PDT] rev 6 index search (fzf/rg style): case-insensitive filter; the hit is highlighted in the accent
+// color and, when it lies past the entry's visible width, the text is offset ('…' lead) so the hit sits mid-entry.
+const escH=t=>t.replace(/[&<>]/g,c=>c==='&'?'&amp;':c==='<'?'&lt;':'&gt;');
+function tocFilter(){
+ const q=document.getElementById('tocSearch').value.toLowerCase(),ls=links();
+ if(!q){ls.forEach(l=>{if(l._hl){l.textContent=l.title;l._hl=0;}l.hidden=false;});return;}
+ const nav=document.getElementById('tocNav'),pr=document.createElement('a'),sp=document.createElement('span');
+ pr.style.cssText='position:absolute;visibility:hidden';sp.textContent='0'.repeat(100);pr.append(sp);nav.append(pr);
+ const cw=sp.getBoundingClientRect().width/100,cols=Math.max(4,Math.floor((pr.clientWidth-24)/cw));pr.remove();
+ for(const l of ls){const t=l.title,i=t.toLowerCase().indexOf(q);if(i<0){l.hidden=true;continue;}l.hidden=false;
+  const e=i+q.length;let s=0;if(e>cols)s=Math.min(i,Math.max(1,i-Math.max(1,Math.floor((cols-1-q.length)/2))));
+  l.innerHTML=(s?'…':'')+escH(t.slice(s,i))+'<mark>'+escH(t.slice(i,e))+'</mark>'+escH(t.slice(e));l._hl=1;}
+}
+function init(){
+ const main=document.querySelector('main'),lane=document.querySelector('.parts-lane');if(lane){main.after(lane);lane.removeAttribute('data-pre');}
+ const nf=document.getElementById('nofiles'),content=document.querySelector('section.content');
+ rowNodes=[...content.querySelectorAll(':scope > .row')];if(nf&&rowNodes.length)nf.remove();
+ const nav=document.getElementById('tocNav'),frag=document.createDocumentFragment();linkNodes=[];linkByTarget.clear();
+ for(const r of rowNodes){const a=document.createElement('a'),t=r.querySelector('.row-cmd').textContent;a.href='#'+r.id;a.dataset.target=r.id;a.title=t;a.textContent=t;frag.append(a);linkNodes.push(a);linkByTarget.set(r.id,a);}
+ nav.replaceChildren(frag);
+ // [2026-10-15 PDT] Restore the preserved native anchor + CSS smooth-scroll handler.
+ nav.onclick=e=>{const l=e.target.closest('a');if(!l)return;const r=document.getElementById(l.dataset.target);if(r){r.classList.remove('collapsed');syncFold();}};
+ // Strip click (not on a button) = expand/collapse that row.
+ content.addEventListener('click',e=>{if(e.target.closest('button'))return;const s=e.target.closest('.row-strip, .meta-hd');if(!s)return;s.closest('.row').classList.toggle('collapsed');syncFold();update();});
+ document.getElementById('delete-cancel').onclick=()=>{pending=[];document.getElementById('delete-dialog').close();};
+ document.getElementById('delete-confirm').onclick=()=>{
+  const ids=pending.map(r=>r.id);
+  pending.forEach(r=>{links().filter(l=>l.dataset.target===r.id).forEach(l=>l.remove());r.remove();});pending=[];refreshNodes();
+  document.getElementById('delete-dialog').close();syncFold();update();
+  const d=new DOMParser().parseFromString(__src,'text/html');ids.forEach(id=>{const n=d.getElementById(id);if(n)n.remove();d.querySelectorAll('[data-target="'+id+'"]').forEach(n=>n.remove());});
+  __src='<!DOCTYPE html>\n'+d.documentElement.outerHTML;saveEdited(__src);
+ };
+ // t82u description commented out: document.getElementById('description-cancel').onclick=()=>document.getElementById('description-dialog').close();
+ // t82u description commented out: document.getElementById('description-save').onclick=()=>{const v=document.getElementById('description-input').value;document.getElementById('report-description').textContent=v;document.getElementById('report-description-row').hidden=!v.trim();document.getElementById('description-dialog').close();saveReport();};
+ document.getElementById('tocSearch').oninput=tocFilter;window.addEventListener('resize',()=>{if(document.getElementById('tocSearch').value)tocFilter();});
+ document.querySelectorAll('.accent-dot').forEach(b=>b.onclick=()=>{document.documentElement.dataset.accent=b.dataset.accent;document.querySelectorAll('.accent-dot').forEach(x=>{x.classList.toggle('active',x===b);x.setAttribute('aria-pressed',x===b);});});
+ divider=document.getElementById('resizer');aside=document.querySelector('aside');
+ divider.onpointerdown=e=>{resizing=true;divider.setPointerCapture(e.pointerId);document.body.classList.add('resizing');e.preventDefault();};
+ divider.onpointermove=e=>{if(resizing)width(e.clientX-aside.getBoundingClientRect().left);};
+ divider.onpointerup=divider.onpointercancel=()=>{resizing=false;document.body.classList.remove('resizing');};
+ divider.onkeydown=e=>{if(['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();width(aside.offsetWidth+(e.key==='ArrowLeft'?-20:20));}};
+ rail=document.getElementById('scroll-rail');thumb=document.getElementById('scroll-thumb');
+ rail.onpointerdown=e=>{dragging=true;offset=e.target===thumb?e.clientY-thumb.getBoundingClientRect().top:thumb.offsetHeight/2;rail.setPointerCapture(e.pointerId);seek(e);e.preventDefault();};
+ rail.onpointermove=e=>{if(dragging)seek(e);};rail.onpointerup=rail.onpointercancel=()=>dragging=false;
+ window.addEventListener('scroll',update,{passive:true});window.addEventListener('resize',update);new ResizeObserver(update).observe(document.body);
+ document.querySelectorAll('button[title]').forEach(b=>b.setAttribute('aria-label',b.title));syncFold();update();
+}
+document.addEventListener('DOMContentLoaded',init);
+
+// [2026-10-27 PDT] blast25: exit code arrives after the command; stamps its rows (failed = .bad, title = exit code).
+function __rc(ids,rc){ids.forEach(id=>{const r=document.getElementById(id);if(r){r.classList.add('bad');r.dataset.exitCode=rc;const t=r.querySelector('.row-ts');if(t)t.title='Exit code '+rc;}});document.currentScript&&document.currentScript.remove();}
+// t82u description commented out: function editDescription(){document.getElementById('description-input').value=document.getElementById('report-description').textContent;document.getElementById('description-dialog').showModal();}
+function __u(o){
+ if(o.stats)document.querySelectorAll('.hdr-stats .kv').forEach(k=>{const v=o.stats[k.querySelector('.k').textContent];if(v!==undefined)k.querySelector('.v').textContent=v;});
+ const nav=document.querySelector('.parts');if(o.parts&&nav&&+nav.dataset.total!==o.parts){const cur=+nav.dataset.cur,base=nav.dataset.base;let h='';
+  for(let i=1;i<=o.parts;i++)h+=`<a class="${i===cur?'current':''}" href="${i===1?base+'.html':base+'_p'+i+'.html'}"${i===cur?' aria-current="page"':''} title="Part ${i} of ${o.parts}">${i}</a>`;
+  nav.innerHTML=h;nav.dataset.total=o.parts;nav.style.setProperty('--part-columns',Math.min(10,o.parts));}
+ document.currentScript&&document.currentScript.remove();}
+
+</script>
+<style id="monoblock">
+/* [2026-10-30 PDT] monoblock (approved v4 + v5 globals). Pager lives in the header bar, inverted on black. */
+.hdr-bar .parts{display:flex;width:auto;padding:0;border:0;background:none;gap:0;grid-template-columns:none}
+.hdr-bar .parts a,.hdr-bar .parts a:nth-child(n){width:30px;height:28px;margin:0 0 0 -1px;border:1px solid var(--paper);background:var(--ink);color:var(--paper);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;text-decoration:none}
+.hdr-bar .parts a:first-child{margin-left:0}
+.hdr-bar .parts a.current,.hdr-bar .parts a:hover,.hdr-bar .parts a:focus-visible{background:var(--paper);color:var(--ink)}
+.parts-lane{display:none!important}
+/* Jump buttons: arrow-to-bar; x set by mbAlign() so global toggles = row toggles */
+.hdr-controls{position:relative;flex:1 1 auto;height:28px;margin-left:0}
+.sb-ic path:first-child{transition:transform .18s cubic-bezier(.2,.8,.2,1)}
+button:hover .sb-ic path:first-child{transform:translateY(1.5px)}
+.sb-up{transform:rotate(180deg)}
+.foot-ctl{position:relative;height:28px;flex:0 0 auto}
+.resizer{height:auto;align-self:stretch}
+.foot-ctl button{position:absolute;top:0;width:28px;height:28px;display:flex;align-items:center;justify-content:center;padding:0;border:0;background:var(--paper);color:var(--ink);cursor:pointer}
+.foot-ctl button:hover{background:var(--ink);color:var(--paper)}
+/* v5 global: header date aligned with the title, larger (below the 34px title) and slightly bolder */
+@media (min-width:901px){
+.meta-time{align-self:center!important;top:0!important;font-size:24px!important;font-weight:400!important;padding:9px 12px 7px!important}
+.meta-time>span:first-child{font-weight:700!important}
+.meta-time-spacer>span{font-size:24px!important;font-weight:400!important}
+}
+/* v5 global: search placeholder = magnifying-glass glyph */
+.toc-search::placeholder{color:currentColor;opacity:.55}
+
+.row-ts .ts-d{font-weight:700}
+
+/* ARTIFACTS / METADATA: index labels + body section titles with badges */
+.sec-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;font-weight:700;letter-spacing:.08em;color:var(--ink);line-height:22px}
+.sec-hd .sec-lbl{white-space:nowrap}
+.sec-title{display:flex;align-items:center;gap:16px;margin:2px 0}
+.sec-title .sec-badge{width:var(--badge,32px);height:var(--badge,32px);flex:0 0 auto;color:var(--ink)}
+.sec-title h2{margin:0;font-size:20px;font-weight:600;letter-spacing:.12em;line-height:1.15;color:var(--ink)}
+.sec-hd .sec-fold{flex:0 0 auto;width:22px;height:22px;display:flex;align-items:center;justify-content:center;padding:0;border:0;background:none;color:var(--ink);cursor:pointer}
+.sec-hd .sec-fold svg{width:16px;height:16px}
+.sec-hd:not(.collapsed) .pm-v{display:none}
+aside .sec-hd{margin:12px 0 8px;padding-left:var(--toc-tx,0px)}
+aside .sec-hd:first-of-type{margin-top:4px}
+/* index row: full toggle set; simple one-line header */
+.meta-row .row-hd.meta-hd{display:flex;align-items:center;gap:12px;padding:10px 12px;border-bottom:3px solid var(--ink);font-size:14px;line-height:32px}
+.meta-row.collapsed .row-hd.meta-hd{border-bottom:0}
+.meta-row .meta-hd .row-cmd{flex:1 1 auto;min-width:0;padding:0;margin:0;border:0;background:none;box-shadow:none!important;font-size:14px;line-height:32px}
+.meta-row .meta-hd .icon-cluster{float:none;margin-left:0}
+/* index search: matched TEXT in the accent colour, no background */
+nav.toc a mark,[data-accent] nav.toc a mark{background:none!important;color:var(--accent)!important;padding:0}
+/* scroll thumb = black/white cascading chevrons (rail and drag behaviour unchanged) */
+.scroll-thumb{background:none!important;border:0!important;border-radius:0!important;box-shadow:none!important;animation:none!important;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.scroll-thumb i{display:block;width:9px;height:9px;margin-top:-2px;border-right:3px solid var(--ink);border-bottom:3px solid var(--ink);transform:rotate(45deg);animation:sb-chev 1.2s steps(1,end) infinite;pointer-events:none;filter:drop-shadow(1px 0 0 var(--paper)) drop-shadow(-1px 0 0 var(--paper)) drop-shadow(0 1px 0 var(--paper)) drop-shadow(0 -1px 0 var(--paper))}
+.scroll-thumb i:first-child{margin-top:0}
+.scroll-thumb i:nth-child(2){animation-delay:.4s}
+.scroll-thumb i:nth-child(3){animation-delay:.8s}
+@keyframes sb-chev{0%{opacity:1}66%{opacity:0}}
+@media(prefers-reduced-motion:reduce){.scroll-thumb i{animation:none}}
+</style>
+<script>
+/* [2026-10-30 PDT] monoblock layer: runs after the report's own init (DOMContentLoaded order). Presentation only. */
+(()=>{const KIND='dp',$=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
+const CHEV='<svg class="icon hi sb-ic{c}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.75v12.5M6.75 11 12 16.25 17.25 11"/><path d="M4.5 20.25h15"/></svg>',CUBE='<svg class="icon sec-badge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21 7.5-9-5.25L3 7.5m18 0-9 5.25m9-5.25v9l-9 5.25M3 7.5l9 5.25M3 7.5v9l9 5.25m0-9v9"/></svg>',STACK='<svg class="icon sec-badge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75m16.5 0c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125"/></svg>',PM='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path class="pm-v" d="M12 4.5v15"/><path d="M19.5 12h-15"/></svg>';
+const C=x=>(+x).toLocaleString('en-US');
+function comma(){$$('.hdr-stats .kv').forEach(k=>{const n=(k.querySelector('.k')||{}).textContent,v=k.querySelector('.v');if(!v||!n)return;
+ if(/^(dirs|files|hits)$/i.test(n.trim()))v.textContent=v.textContent.replace(/\b\d{4,}\b/g,C);
+ else if(/^types$/i.test(n.trim()))v.textContent=v.textContent.replace(/\((\d{4,})\)/g,(m,x)=>'('+C(x)+')');});}
+if(typeof window.__u==='function'){const u0=window.__u;window.__u=function(o){u0(o);comma();};}
+const DP=KIND==='dp'||KIND==='dpc'||KIND==='mbs';
+function fold(t){return '<button type="button" class="sec-fold" title="Hide '+t+'" aria-label="Hide '+t+'" onclick="const h=this.parentElement;h.classList.toggle(\'collapsed\');h.nextElementSibling.hidden=h.classList.contains(\'collapsed\')">'+PM+'</button>';}
+function el(h){const t=document.createElement('template');t.innerHTML=h.trim();return t.content.firstElementChild;}
+function build(){
+ comma();
+ const bar=$('.hdr-bar'),nav=$('nav.parts');if(bar&&nav)bar.prepend(nav);const lane=$('.parts-lane');if(lane)lane.remove();
+ const hc=$('.hdr-controls'),sb=hc&&$('button[title="Scroll to bottom"]',hc),gf=hc&&$('.gfold',hc);
+ if(sb){sb.innerHTML=CHEV.replace('{c}','');if(gf)gf.after(sb);}
+ const content=$('section.content');if(!content)return;
+ if(DP){
+  const toc=$('#tocNav');
+  if(toc&&!$('#tocMeta')){toc.before(el('<div class="sec-hd"><span class="sec-lbl">ARTIFACTS</span>'+fold('artifacts')+'</div>'));
+   const mh=el('<div class="sec-hd"><span class="sec-lbl">METADATA</span>'+fold('metadata')+'</div>'),mn=el('<nav class="toc toc-meta" id="tocMeta"><a href="#meta-index" data-target="meta-index" title="index">index</a></nav>');
+   toc.after(mh);mh.after(mn);}
+  const all=$$(':scope > .row',content),meta=all.filter(r=>r.classList.contains('metadata-item')),art=all.filter(r=>!r.classList.contains('metadata-item'));
+  const t1=el('<div class="sec-title">'+CUBE+'<h2>ARTIFACTS</h2></div>');(art[0]?art[0].before(t1):content.prepend(t1));
+  content.append(el('<div class="sec-title">'+STACK+'<h2>METADATA</h2></div>'));
+  const mn=$('#tocMeta');
+  meta.forEach(r=>{content.append(r);const l=$$('#tocNav a').find(a=>a.dataset.target===r.id);if(l&&mn)mn.append(l);});
+  const cl=$('.row .icon-cluster',content);
+  if(cl){const part=(nav&&(nav.dataset.cur||($('a.current',nav)||{}).textContent))||'1';
+   const txt='part '+part+'\n\n'+art.map(r=>'\t'+(r.querySelector('.row-cmd')||{textContent:''}).textContent+'\n').join('');
+   const hd=KIND==='dpc'?'<div class="row-hd">'+cl.outerHTML+'<span class="row-cmd">index</span></div>':'<div class="row-hd meta-hd"><span class="row-cmd">index</span>'+cl.outerHTML+'</div>';
+   const mr=el('<div class="row meta-row" id="meta-index" data-copy-path="index">'+hd+'<div class="row-output"><div class="out"><pre class="ln"></pre></div></div></div>');
+   mr.querySelector('pre').textContent=txt;
+   const mi=$$('.sec-title',content).pop();(meta.length?meta[meta.length-1].after(mr):mi.after(mr));}
+ }
+ content.append(el('<div class="foot-ctl"><button type="button" title="Scroll to top" aria-label="Scroll to top" onclick="window.scrollTo({top:0})">'+CHEV.replace('{c}',' sb-up')+'</button></div>'));
+}
+function align(){const hc=$('.hdr-controls'),r=$$('section.content .row').find(x=>!x.classList.contains('meta-row')&&x.offsetParent&&x.querySelector('.btn-out'));
+ const pa=$('.hdr-bar .parts'),kv=$('.hdr-deck .kv');if(pa&&kv){pa.style.marginLeft='0px';pa.style.marginLeft=(kv.getBoundingClientRect().left-pa.getBoundingClientRect().left)+'px';}
+ const bi=$('.hdr-brand .icon');if(bi)document.documentElement.style.setProperty('--badge',bi.getBoundingClientRect().width+'px');
+ const a=$('#tocNav a:not([hidden])')||$('#tocMeta a'),h=$('aside .sec-hd');
+ if(a&&h){const cs=getComputedStyle(a);h.parentElement.style.setProperty('--toc-tx','0px');const x=a.getBoundingClientRect().left+parseFloat(cs.borderLeftWidth)+parseFloat(cs.paddingLeft)-h.getBoundingClientRect().left;h.parentElement.style.setProperty('--toc-tx',Math.max(0,x)+'px');}
+ if(!hc||!r)return;
+ const L=hc.getBoundingClientRect().left,g=s=>r.querySelector(s).getBoundingClientRect();
+ const step=g('.btn-out').left-g('.btn-in').left;let fold=null;
+ $$('button',hc).forEach(b=>{const oc=b.getAttribute('onclick')||'';let sel=null;
+  if(/deleteRows/.test(oc))sel='.btn-del';else if(/copyAll\([^)]*true/.test(oc))sel='.btn-in';else if(/copyAll/.test(oc))sel='.btn-out';else if(b.classList.contains('gfold'))sel='.btn-fold';
+  if(!sel)return;const t=g(sel);b.style.position='absolute';b.style.top='0';b.style.left=(t.left-L)+'px';if(sel=='.btn-fold')fold=t;});
+ if(!fold)return;const x=fold.left+step,sb=$('button[title="Scroll to bottom"]',hc);if(sb){sb.style.position='absolute';sb.style.top='0';sb.style.left=(x-L)+'px';}
+ const st=$('.foot-ctl button');if(st){const rr=r.getBoundingClientRect();st.style.left=(rr.right-st.offsetWidth-st.parentElement.getBoundingClientRect().left)+'px';}}
+document.addEventListener('DOMContentLoaded',()=>{try{build();}catch(e){console.error('monoblock',e);}align();});
+addEventListener('load',()=>{align();setTimeout(align,200);});addEventListener('resize',align);
+})();
+</script>
+<style id="mb7">@font-face{font-family:'JBMono';font-weight:100 499;font-display:block;src:url(data:font/woff2;base64,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) format('woff2')}@font-face{font-family:'JBMono';font-weight:500 900;font-display:block;src:url(data:font/woff2;base64,d09GMgABAAAAADR8ABQAAAAAbIgAADQSAAI2BAAAAAAAAAAAAAAAAAAAAAAAAAAAGnAbIBxKP0hWQVKCEwZgP1NUQVRiJxoAhBgvOBEICu901wowyj4BNgIkA4cKC4NMAAQgBYViByAMBxv1XDXKza4EnAcwKeH3G0RRJlZ3N6Ka1HH2/39NOg7b/KsQAJmohK4IS0XKQeDY3UY4ZppHt7Q+u8pt2RwsTET6hUT3Xt8fXvcHF860avWm2zC/2XT8d7+qMSB5r7WSp8DRUaDPiqrgPDg9hx5kUolKVGpVvDfthtBNYl1BJgYPC1jm3j5CktkWnvi29M18AglrVFVu4qK0flLd4WlO/yGBpHU0xBQIxO/iQkIUDQRiggevIhPoqDgV+6MmdJ2Yde3K1pn+TrxbheL7294PrPEm4oQTiTTGEHqXa7aZuk0JAoU8EKqSptwzCMlKACkCxSQLTv79dH5Nk+owDmne30f1KFwE+3BQsWVN/xOJKBCC4mz32+Pf1vmKtX/srTUbX6lqbOVL+QqAjgiS3WOqFRMYQCNh4dX58odYNK1lPlbFt11M/vMl3crYmPtp+g1CxvKZy8nfLboSKf9tUbTb5R+nLyQBAgaGmV/TPhEHMagBRDOxJf4trZzP43N3Dodzr4kT04yKUNQOdI/krUkDK86ia8sHCPU54m8WHYPzQu4zb/j/P1e+G1h4NymhJBZ2W2HoQyZ/ZgldFdDEJnYZhGn5+D2+9PfmrNL3xWi2x9Nn4SyqWVWhtZxP+zx1F/n4krD7N582H8SnYSUamDkE0hRImqlGrGlYJ2AM0swa43XeN5KmZMYxZu15H91udsbYJLvw8tT4IA2Pf36/YfUILxjiWhP+clm4Na18UN/fL/vcBFCLPY3CFHSnyrz1c46xtDKo+d2z9VqTWps1hiIii4gIRMlz9/dBgCCir+LJwjHjyNrw2an58nR8ZVa+JhtfWy1fl5evp4FvIMC3EeXb6+C76eJ7yGg7e17Yi+SowSUlgqyKlW1egMQCiEYlpGpjRnzZxWWdW2Q6RcFAoovqDYA8yimyECg2Y+My0PoBJ1xC67IjgiKh3hv/GqrThG1e2PqF7WB4RvRfBxGZQqXRGczyikpWVTWbw+XxBUIIFoklUplcoVSpNVqd3mA0mS3WGpu91uF0uT3euvqGxqZmX0urv609EAyFI9FYPJFMpTs6u7p7evsy/SgupNJ0w7RsaAARJpRxIZU21vkQUy61abt+GKd5Wbf9OK/7eb8fLoiSrKiabpiW7bieH4RRnKSu5wdhFCdplhdlVTdt1w/jNC/rth/ndT/v9xPhx8ZGDAToRHoEoIafNIVf2TGFOIJXHA6Du/oFnI5Le3aa/v4AMFfOUPfOqZn1IZAWAukBql2OSSdmlN2vXTyzlf8FUiJree9kkmNXlxBbD4tWP8B7cpp1TNoizs6HQVDxei4qcco6zoDwS2vFrQaENGrYUsn4XLVYavzB5xAmD4k17qb1lFsJFVSFqliVqnrVpDr/uZ4Sl9TBq5O7FFN+pR7eqDriVehG//WnsIT/+G39Wf4CvxdZpEa6uOdWb0oGy7pGQ2y7+tJWs+3mvwdnbDPfArPsM8FS48010SSHHXTINKcJcbgECZNAkWIlsHDwCIjIylViqVKNTUAIAhPba54ljlvlkWI0tPSMatjY1fKq16BRE5+g8CgVHZ/QSbuX/zvNumKRo3aYaqc9dtnrqnMeOq+PE45Z5oInLjpilNEeO+GsGZ4aqa+TxhpjnOliUAwOFjaxBIhvOZ6VMEqhlVlKWnQUVEw0j8iMj4OLR6RCjIKUjIqckpqOlYmZhYeTi5tBszYtWgX4Paq5Dkkpab1C+hyzwWprrbPGNdfNJIAnGyGhbFxdxNqG04RJCzxiw+FhCYlTYkg48kWbCMRGxOViAOUi47mExyq9DFnlJFijSaqzoUwpofLSuIhXk0hXMyRA0gwujbB6hOHSFaPJoOuSxDu4ihpoHpOciKO8TKen1EBMYoWfUFDHvF4UwmMYM3RUqOOE0CKUkWlAIxMDdrVLaUwVSZXV5GO9opRS59JU1Bizb/ZsaRSN0zlz9HoToxA+id6IGSWYuzL6izHYjfvAZpBtsx3k1C9tu5PBig/X/aXFUWgQzvUPD41XdxtmY1hEorBb7fmsZ7NaW+lWzi3WG1smTLwmFp0mqmmLuhx/XBNO3TTX12VJK3WRtmfVeRFd0UDUnsj7aqv9ksTKji1FlnyRa+foUxXjOlJ05pYMaW75Qy3i5jU128Xtah1iR52aQLdLvPOgdmO5qDA1Mvx0f7EyZYMwHDKIYzyo7uCjpCIoAnbYqkdqkiNxRfN1otXc/YR6Ae2uVRrvc2kAb+/Q8/F37T2wOO0IklmKNqaN6XH0mgNyKUo5pslMUiXf46hV41BQmBxexJiJxhoRTBW5aEL5tTxhFy+DmMsTOSwLLFpaIp0yaaY97canZ+k75JkojDUfKrTcQNXhjNFZbVzq44MraMQLbr+u61Z4el1q3vG1ryZSweFmjWI1SIWorESDhCjl1bob5zdI7XrEbRnR+K/VGqtUEX+oylrdJkQhmu7G4eFpi+UjLDO8zKZMutdICW0H2dpAvkZDge3VHJ2Vz01w3vfl0HIFP+K2Dq6+bYnllw3WZihpV0TP0rv0knZwq5J3XmCGccndWlHdugyzR8RUhlzGc7F1q4qUqKY2MzDlzxlUoff2oBtKcJYPACMOiUDyCsCqie0J55r8i10CpSv+TLH2iTxrdyp0WfjSTUyAOULrrEEkD4y57nSiKcXw9swqwbqSVgCQu06RlmuTIpXLEeKI2P6LMbsImqnITh2YiNYUyeH+22sPF7NeZ+AdB7x4lSTLIlVpPw3AFGxfIQuYGa3qZf8gvQqDsYJdpoozGaB3PrJgl+i+8anIU5zJYWrJzxQqodNUdQ6PNBTPjCgWBkYxCvW6qZL/d6Q0H1JKPXlemveQ5j+Q+oBrZQDjNGFWLyhWVaPodamY47Svbk1TxRUUteBarPgwABfc60cz+QGarJM04dVBCOILcqWlIzGporHpoplVD4d71N0Bkl8Hh7GoG1fct7wjVDkrp6THKXs62T04wmRMu4kPIZPmVtTVusSfABFV0BxtLVeJWAZWGDO38Lj22cctPo0+uI31JPCJvlumt4UpKJRYcOvWLHAqVU9NdB5+DOwx7pMlu9zMdhqRK59oYvCQs9vQ0SIKBMHsaNQRqWLahIDA6Q8ZeJqthP+d74ZB97/ERlImF2vYtYZA99yeZjAQrBZkmOI4G2DfbNHcGC/z1Q3TMCUbBmSkVjQFFud5FsrojJAwT+dUrGq0fdk2w//Kidt1dUi1aI92OmaFU+N7ojVmuMD8sOp/fvX6oqS+Q9ejGj3F8QDGHQMRBO5IhggCHOLQ124oU5KJhHqIt7yCclXE8g3ggFmxB8l+ZKdNKa9AzDPuZ7RftZjjdDgxW9CsG3nGJbtozYt0skFggX9WHKaSH6k34h7UVSqWdGAxpUEiYLz40Jfj8siQJoQiFX+JScQCz1iwlxTMhWemb3pyAJTCxG/aIrAl/tNB78ZZWMmXEpbvhC13IQba/r22lZJCZOw6Jwv3JTfc07X40Xfhqj5KnbcH7bXnYve1R0Dpfuyw87f/W+at2S/eis/l8J4PmCer2qXQZeWc0SvSNTRrRDn1Wjg9t33H1yNv+WbEEZYMeQEy1oLZiMXxVnqJRRbFWhnEhSK/FYk1HgfdLp0oZg0CdgcQDSqzbrv77bmrUakvjiKEQbRJ2+t/RawvxnpC6JJSjJNi0+hIYJGpshFUjjlPY7Plice8ozVZqIz6vDjlQIEcuMJrP9LLHnfdzU26/eLgVJUa51c1UukyWexRTZujmdesfAI+mB1t+qsplTXnNqd+j8OeXrO7tuCm0eZB+TtrKmStsvb5lGR9G8nW6L0TPgdwrxQhjubDFu3h4dJUowV8sOGi4m9s/SvOZVIS+nDawB8a9LDZpng3gAWju0sb6NnUshCuazGPsSPbt2iVjmJEukbxTUv7vuFeMEtGCNLVWCXPnBL3J4aXAWW+lHg4HeF5mkTWQiPQc4M3eLmETa8d2CLVPghtHje5pZHWu/C4boxoJLPbszKd8cM0/AV+rOGj3EmhoN7IWM+HfC0e8ZJ901hHYjkwcKaZmS7qyxtBXq91V2sgF4+ukJw6rSeTR4FSwvUGu0IMxLu8WuyS5GzTbiVNRnCcViusDs6h7o9u5iq3L1weNVHOsYe9gUzoaBTMM2I47F4mdtTB0B3mw/LgmI1hOPCvvPT36NA5B6QlYzMZYrbik5hyiyGJmNsFZAbcjBSPn8bkSR07oy2oAkscm3JSWGXRXD5XRzpoqtW2lz0hZtQOgzYdWmZisUz2PiS5uMxN1K3m4JkWyzXtkKfhmVadmWv+UYnGV91S0jsUkqKupNyDAzN0T8DmtkaRy7x8T94xfl8sadp3nuYds+d0KVf2fY/K13aN/+ceqLz4SsVFZdG+6tfmV7g4nOXOebByw7WDkTOvbY9v/+RMpPixCfKj3JX9IQi4Fj5KDIcaeSxzDZOX73RXcFwSlag1yjMNBLvEGhkEa9TirvaEcI7DfVCQBByUISoQtWu0WlFbVGAwhoUivzYD74KgY7AWOg5Bu6GMWtQeFoI3LyutpS8tTbhbSGlWS89fnMRRDQJp1mukL7xN4+xYeM+aFMnChmKDLJIdrC3JVqlGJS4WRZu0FaCsHrTn4/Zvftf4Fs5HlS9jo9jPlVHg/eiZdO3bwjRfyD+csM3C9vHo3xc1n8RzG3At9Fe+Udn/NZf+DT3wx7Yu2Rrbu3iQgKWojjVDsYxEpRaL73buOpkm5sbXDALnQn+VbyNrzVzr2dHxbfpmA0gu9HdK00Cx8IDpu0ML1dULm/XfPbDQ+X8eog/ZvygJR1s64y0GVBSZQfRD/wf2hU1v1+Hz3DmN1ERqWfatuspcR46X1gtYKENYALWah9rCLCRIIquagxryhxWFEpAWjkNQHNZCw2AnrrAkFC73Gfzl6H64D923yP3AufCbOQFLQ3qtNJyWMa/G37MaVqsgkVoJr5bAx3DjlCHIh33qtsGu2NTplWtFr/AFV+G1YM98er4892C+IQqJAxq5VtzuUwZjZLWqXfsfX1Ay8PxPK+C9kBx+Qih8ApZDp4Bz4RtTXChp11gs6a+3wONjjHbmTC/0fwi6AfWCapQ1xZP6lBmODpKJ/uAwH7m/Ae0uaequVcJNYb4hPpwGzf3VWyHBOlb50dHmMndxY5dLKW1JCMBvXc+l/0k/1wVYqGSmL7wksxhugYRpeHFmSbivD3z2yLWhns92LHeJxctcO7s+7X/kGmizXYuxc7NInIKVKudKRW5UkrtS3ZaVxeFmsXMjzmsTImSRSrUCqFQ0ORIQX888HR5vf2oLQiL5c0vwqTVPB14fHE+9syXPKkVsSb8Lflt89a3hYeTrObnZOY8PIIdt9WJc3dW3y9NzXw8lcRr8iqoLNtqdyYa2zbzKNi5rwtGLrBlqagn3heoHeoOFIoXPSG8QGcVVxo3ltxgVa8AJlNJSqxEr660mhZ16AY/5jBDU1biUzPKtpDzSOJqus3vMOz9Mkf7E4O5gg2qHQ0NHj5//ZXq+saAOiyCl5NjPCGLsTw/9O2An/4HDfkUG9Si9o0Y7VZboW+jfm70OM6V11ug8oe72Xe2h7tGwYAqegacE3GloBpoGHJQxKhC3a2a04raowBgZTmQ3Z6o286BX4RnoNYi3uSqT3TycAK9eVlrRl4wdtoPxSkC8RjgAUKyph69ATPa6vf0LfYkycV3EhHmj0N3kKI+rrwFQiTB3SGQxvU4QbIUVpGLlA4tKEFVS5wGtL1Vt9E9EZlW+aKW2VWAUbNBYZKm0zBqSGowy5s2NTLHBKJUFJ8BC6SNCUbt6Rm3FnNYbwp++VkJeluy0uLor3bfEMOwp0xNlMxLRWWnpjwC8u342OVtv9LlrD8UOYBbKvFeTV9eD3fOhucqdDF5WBHOvptaiqwt0t3e0M6vTYXnNvWVZ8QzLFW9tKZXwRqFQ60eTcAhOWojixaw4YaHC0ap3BxK+VH+bMM51Dxq4GdQmn/UcS6CfOJME7vn0RuEu4fZP096c0GBfDHgW+je2TC+Mn0Cexk1u+LblO7AGqq1k2YUvXEgwq4k0wvEEEDEC5qLfOYyKaq5REaB9yYFZAqlNfSR2AL8Rjd6PP1h/gLA/w5pXA5yMvgR7iKERBxbSEBaI2rVT2ijbDOwqYRpDJxHhbtGUeJdQcEw8JToOblxMRcbk0UIX80wzK2aWj8CvC2eg12D4NWhG+DpwzCsUaxuv9wTPparyO/livVPd8ySW8afgGdH9fJ7mTbQf/7z3860H9OFbmcUkehcye7PXYWd19eEjYX4Y29gyP5xPOKKtrdF7AmJkHv3K0I4M9YHry7SIS4j+w0mCIKMrgaeom2qb7U2RdIAxTBBP8wWrRM2gFKloZgj17P7K5UwW908S4fCDBlTzUq/ZYg97QoymhAOh62c8QWdUryPh5RETyr+0yWZ1xhsSoHaZGm4PCXWGaLXEIxdU1bgrNi1/prGa65UpxK1RoUEeEYquC6EFUXUriz/KFZ4QCh6HloG4vc5bg9+Z2Lkns+dK4gpeBO9IgEpUdKAv3NjfIErx+KOihv7G8FAf+Pwh+mC6fv8ynmbZmmT9wEU6SHvoQU6rNE9TVITSSKFWP8Q+lKa4GAk8Sz19hN8i67hCagcyqAUwn8HOoyabZ1Ifi8s/TqVFJucXPY2ZjOxLXZdIbozS1zY4Nm9/74284Slm5ked4MdwlDmKugZcaaobGzucZroFMZB6SZSzofADTOnnBFXdfzxYzal8fndutb+ceYbfUt1SkiksfAlNWYtdXL14z3LAekqsU/J0fJ1cLA5ip/I2bTLYFRgdhojFElGzArBQxigkun4gEWc0IZGqOYgrmyEEq9RCuTD2w4cq6H08lYCn4PsvGoEK6mNPL31646q54Zm+PTHg7v3im0K2uxLayxf/LO4HemkoAZv0YQHcqtbqVtdY9++TJADVpdn8qn7ho7DoZJX0fvA6Uw/uwUe2pl57gpwc6QmIVSJ/XACmtxlPle0eYz3MuHIs8z9QgQoMBRGeDDTCEw0LTdAQTME/0pu7eXuCkf0R/lWOGVI2BdNBU3CwB1ShLB1yWdoiJHd9fgaz/rJLp9ARK2T1Ik7IYJQlUlJLSGKwKBQhKsn+rIPDeR1/JDNXrnfdSQIWyhTjihvlWnOrhZziuk7RWT1c7hiLdlKT4tqpRr/atyqZDME32XSW2tUtNJJNjUox5A1ydLoAB/KKVcYGE6VHqD5L494EW5r+NQvrTbJ4Wmq2puWylFVI6vr1DCarhw/sbawModDKIAT9Q9AeWCuadZgVaeGTe9ucEdf4Vwbs2GYZRw83NLabUu0xCziwzXd0UJEsocRI5BjFlaV12/VGl11DrzI3D7ovmwF2yui1aZzkSQo5QqHUkQm6eucly7/eniRRbTcptB4bkNSstzx9sLDsYzTmdpkl26SUSoxSHvnay/bKRYcyBQkFcZsic9XEOPae2yQJIUOKX7Z1XjN1XgOk0gmumOjH3/Mcg1+xe5v2ZOPqE+57HlkR9Fjefhtj6tUfH4OJjXKzhGMp/geLuVlS8m8ZQWEW7ZJ8Jo05C2G1mM01Si9DJFUsVCWoqMyqHDupAGD3AQe8az0MWBsqcDQ6rqIr0Wm48h2W0bErFctZHNh/vhpXRbtOpf5ELQq/Uup1GvgelewXjBZ7l2N+xmoxn+0oPPP/bAB8Wdw9OTbp20q+I+hweB2BQOTjGyv4YX5DcaK+L26w+YmhQzFIRBOD/LEIEcGLH2SdNEM3udyb8MaOKUtSKG3Tynm+RuigX7eA9+C4H0/OHMc/tRVIW9UyblOj4Jw/8S0/+GsO52uR070ekoeADxDRxMDddx4iAtYNsdEoTjsBjzfWy57+ateR/2jc0FTMVEYL0WHG8J/e0nn+PImxJ+2Yk1+HBEvfwsfM52D+mIx41PT/jux6/+l62VOXJ2mefJ2w/ytgJz/mcQYoz4ecPaTH6ld081vDryn2os1t1Wag6ij+/dRwMMC+Y9fIQ/qrwe2Mw69tuxiw7t3Q2Y7ufbLRxukxXTRyuhtrngS9g/1vNtRwuo0XTZyeBtubvQH0dKd1b+DitsOvgVc6JN6KKjuE2oNpFmRSGUEzFrWPzrJ5yqXKFI95pBi1T15jMiD0NosctTdnjsFLAmdHkse4VIjaK7dZ9EUwOe8rPsLkpZRST3mVDdp8kNgkP5PK8JMY1B6oyu6pkIInO04tT+25sicFpjoyh+WnwHRRUp0EdgdPzFucbEwC2br4Z3EAawtthhSoeseo0ZluQGL5md7JPcN85OehYt2TN578tec46xM3nvgVOMzHfnnsp3VfBrofhSKoYT75s6ijl/CMMYP5rq/9sjcQP73kwvDQ8OILooyBm/7nwObZodnFm0HhtFKlpKyfx933G1319a2tBEJrR12dWu3xfpOfhpj3TV29RtPQ0GEnKG578Szn9lz55jP395UPPsdC8V+lUK/4KZTOb6iUbzvB0unx9vzONKjLMHMvfSac+R+VN5ZqzJ9QjjflJxLA089YF/2gYv31V9/V6UeO/zD3WwVrD1T14d/G1TTO9T5Qs3YNjlJWmVyGizAkoroo16gPc0WNuEHMgzzheBXO8u0nxWouq1x38tHe1NvMYDoIZKjGzxo/nY2XVdE5hz/bry2PPJR86JHMzgLmBi3WMbVOWCzj45OTS+6eyYkx3v/4BAiVxjbF3n+TGCDgQ0S0IRql6yPlcxVwzyQvJM//Hh2BXdLBuF/s23yopbwr73r8/UGAkjixTacZUz8D3+mmgL7x3DNsP8xLyUvPnGoE0B27wm5WlTebXl4oKjKVmMN2uc2iLn4NGEvN4MDTE83JN34CRs/pye6Tk+n2/2cerKh4aCL4f1A7v5DxweUQLIZ9GV+4szvIVmNgV17Wvp1g2RzIuvOgQWzBXLXDrNQom371waKqkck08pCTa2RfrPJOk0oThAOmtJ5KF074j4ka4seg6OA19ei0vCB6tsyDub+sdOrdQdnUTe6CwCN4jVc9S6M9xuY+tvLxH+eyT4yeWCdBj1zkKUUfx9hP1I6JdQpIA8W0WKo9iFAPFBhaE1gZ2qga/OcJ9PNN64zGsUZvs3b9KkODo0cm77CcazIS/ik/xFPp3baMXe9S8Q5WXMYv0yO5NKOewa/3pwJefzjebPTlCuhYbherkkaVsTLVYvAtqn6gvT6sVrlOHvqBWMvksy3eCom8oYrjgDvL9CEM2k1Go4dtm9+QdvSmXu3eN8A3Gp3NAYK2euq5aIQQrngc/D3/Q1281ea0x1vq/DOumdYZgNutbKVL9V2DIz1MgmCYSnz5w5bCmuVN9TKpxfpC/qm3D/DsXU1hQlOPA6UbMrLpBA6DjDu6y19Yu6KhQSE1W3/Lf/dXlprvyPgS+S0vvthDpoyVqJe8uL2dRPN8DVgdtl6ZKmXeYbZi3myz93yCnkV48iY2r06yQ8LzNnHkpHISBrWuYFN7pUYNNALFlFRqyDlL2Q10Hy8bsSoazALtt5vme2/ltGrWqJkda6rbAjX5B0SauVOeRiTiTz3HRz9eWvo4mg9Yz+rcDo0mmDq9K4nYn17MeIdZ/imD/nY58xmw25o1smrtf+04lTkFfn12VWZVHydKu/LwXGrueua618Kb0o255BwybPoy8+XR8QY4ME72ksh1ZFLkwYWR4kIjG4sXsMbp24xnO52+vdNtADvRN70+OQ1emohPr+mZBqmJ+6fT4Uiqz25RR8DySY0aGDJqpdLAIHip2ItdjsWC4CiWg54xomd334qlWSuwVjI3URV7l92F/+GawNgOn9sHXrysrCm9tLTo/sdfYDwTwORUkuvaBpGVkfE6sPL5Sm6yS/oqIzXvULfr+luHew1njdD1LqWWR99MNgNkAQDywOeEPOgLIPw06LMvgr4Erq9cy4I+5wd9UST8dPVnf7WWsBSWCEuEJa1ENq1kMiFZSBaShWQhW8gWsoXsVhhckotdpuZBHyCE7wa9/23QFYTrqssYdJkQ9AEQvkvfZ+9yXOy9lRB0mRP0wcrud2Xo+j1SR9bV1NoEQp/QJ/QJfREfdFVImBAmhAlhorUHN9ZT7XYYnxdX7UxywqUwgSNiW000dhycZ2H+YA8SmWKIlgz0PsCDYpme+08GsVvmxU+OWs4FQMXKj5OsLu3NywJoPrM3m25fsfsdv18jNVhqhGL7AJpeuvyG2D6AWjUaMPvVnO+4jdB0+5BYg2qhQD0SoQQ9yQEtjYpfm2vioek86K7JJ8CKwg0g5kGxFtBcW4IINAtKnqkplwFOQrP7R102nYfUBEx4ahDEvECtlEFlo0CPd0PGtZebzQI2m1wiuSzDFh3MTnMZM8+jrssp4zCn6uohBkmPNdFb7jm2xjRbe5nR1iMbX/O6o5+dna9kncSyAFl6xOe1BP4FTE38kuHw/m3lbWe89BmeQZCMUkDKP2mDJCQj2+N28rh34dchtDCbm+3LHso+nv1Q9puLvk9znBx6jvRFLTkDCz+V822um6vOjefuz31lcd9eIBIi2AgIoUNYES5EI6INEUWMIDYgDiHeRLylDXlhBB+qPe+BvEt57+Rb+XC+JT+wOHFv/vb8+fyXPv93kCCpSCcygBxDHkM+gvwcFYsqRXlRQ6jDqHnUe6gP0/YTa7R9dq291+62Z+01q51Dm12LC7kud959SEvHruCmWbCZB3iMZ3gH8Qf4KDq78VF+nm/ZJ9dUGu499Tj4mtH4QX/OX/dbQVYuCrFIq/TIuByV8/Kc/IWJbSIcCR8FWkk8SQPWuM+FJ6wI8bUb/kw6c9pd+JLF6mqwsS6TjocDQA1pKBpAVV0X8t/yMLESWWh3G5SP7n0E7/+//Pj9iHiIB9gx35ssRADlCP3ptUf5aErbS6naPlnzMVxeG92fAhsqzU4AzhMgAMWPTy1anBbCJcoCNkzMrk/qPr8+Ge5rJeE5kWQ0JYHZ7ObNmS0w3JEBAFyHRllj+6lJnR9HD9ynsuMcnxjzXkEppG2P48+DeooYiUGd2KVtIClQw7py7zUN6XtQSbnNJDDdH3fqChUGxFpLctBIKILqKujex91wF0hfz9FEmlc5OxZz3mPsHM0mg8/H6yWiIQES7NEcvZaqUVLIYFlS214Zsot6MFTu6cEqQ6iAJWtyzvHrbsKZjfZhv2maci6l9WSq0++XBnfxxRBbreDiM7p9RE1j5t+RV8/zhzlPwHOsKuZ9Pc7H0bVP7+E+WkBJxgbDELfhHu7L6jR4d2X6GENTLIqo8bNmaJ8z8Kvpmfe/xjH+U+W5iwMylgOY8X18rwakoZDNGZY3uMepiCBZFNaz29BgaIQYXrxaTxoW77v77kPIBw1BggBlf3YDJcABfxcFjX9oAtUOdWm8FlNExROrlLjvzE/Z57/++09BlydPt3d4SGukrfSkplSAddQewuafu3cPbtuhmaccWilIfSsRlSWDjeiWjT+xVaEaI4MD41sCZ+u484ZW/ObEErQNRDz3XwGXkMEc8VoOP6jhdaprlZZevN2l3vdWuvHGG0Tvryk+cEWwte9Mw6m6Pe/cm/nS1yxvxaHBHjb/RQ6SxzQ3DWEEtnZwsZqIKtTo0ScSoNc+w5C0dPbuIOw6MnMC44scENXKfaeIJFOAwcUOVftjqyE5PKOIeNZhMS2kFH6jIP/Vz4mNbY31uZhzVVJr9drNZg3MnuoNoWGMGh1v++zn+SSsFq7IKy/P706htEP/3ytmGZH2uMBsHeXpSmeRMZKjQ3PzuZTbVJl9hDj+mFdY6vpJMMvhF3zBIoNI985Pp7pL8Cf14byKkKrWCMyzA/PXwcnIExp+1niMoVJsQmxpQNkHAfyiesWEiA2vnigOWnz01ZdffSQOK5Fl23kZ9+hWU+dV072BAHOnTt1Y84LB+pe+mTLJJvtif5Il+cdeivLsKKr/L9GHfiPB6LC+uX+s77J3Svk98sg/kiqDxIeqObZZT+J0msaTHMCsbx9ITkhKhshLyqm0/7YFgKz8TRi7Dzv/bz7ng+3n31x89+4IAACK5f/T6rPN+LMruJsCQAPLsXvuAiIYpbzDx+sQeD+bObjzVti4GE8vsrddbuqNDyxga6v9Wwo9gOcqsMqdLZcsTABN6YevNUpAkiIkJhBmUCALnOEQpx3iIZiLx8Z2Z3GrxAxVd1gXgxpMQ9Gqea9iPFG7bTcHQ0yOXD0ZCC70gzgMulQUqirmNu0UCoGQNK94AbMVzt040nAsVfOLx1LSiQkP69W7E/7uvuA8IfRfApqxpj52qMjgE4aKyQibdXcCijLYqOJn2H3h9XCc37dvTSBltrAMzILDgWypuxjvOeNvqzGGGfasGggtCuo+UO1vJKJk14+4IgNLM6NXZWKMa2NxdAODc2yAkxkC2AM4QoRzuaf1XVOWcfwluRfFLj7f9EgGQmArpUCNGtDBYjLuTf3e0udrCFrgEVyckcMVrBaYcEnRWMQz860t981EPkfgbNKYxedaM7dIXOgVOnFQCXF1brd782C7MzymJCabvD8RxNaIEanTRNLIuv4M5ITVCEiBGNcrm5h4ovvaO1oMU66zlFL7sS+Ykhp2qHFF2GRfncXahA3RQ5U9TTUjMlbsDpuJIQmORcrPzw9oXF/eIwfsgGviJJCv7H4brkyyhapxGueIRphEYTefe6q5hpt3yx334ZwqP2AUNEQd1sWBSumx9QN6g9mHoePZ+B3j8iDjE5eJWHo/QDma8owNMa1UXd/JIsVXrHOPTdR6fU0pKQ9qBUQOEsBPDT2Q78jq4xPk924g1QBr5xa6ESJYfKUjLcoTvfn8IunpNyHwz1cB7uGX4EFgMazgbzu1/9KyxBxRQQekbSCeSj2LC4Z9ngiNwc23gIIwVSJ55EhdLa1Y+hB6DV1qsCruXiO89aQqA6yeKn1v5oOax2qfS8psqMOsW3/nOKJ3uei7FrgBut0+drbwKKuIIKQfSFttXA08HJWNJTHBTyriSHaKG4OvpQqAW8ktY5th0auXcCml9Tpe3k1Uq3AxM7lqEq2xqegXwmAXFxlWUpK2m5nn8UesnX50cojeG4wHhH4OzQ45rdcr9+IxFtTYiLP5FoiUpCzh4cV4j1J3b2uSE7a5d6NkYrXMbpJK6UOjSVTZtC71GA1pFmg0YjooQ0zoXDK++yShyHweoVISqbwnsB+GnRuT5wuFmcdWldzFEWsOVhXv0fRBWJnI73wvlwtUY4y1hpnTAcFi2DHn9YPhi8WSmOw4bc3tWtqi23CvWA5iTAJW22FJYbkfJ4Ges7Xj9ZvHLMT54C00HtyHOoefjkX2yZ8SET+kAJtvSqDMWqo0xK7xYhHOOWmfbRL1XmLGwlX8WWh3+2bf48gtQOe5+nuRke4doDBjvJkX3Usk2Bc7Y828THhGcaOzm3TrI+VqsM4CLx4M6w28/gAodbFuQuj29OL9BOFAPd1mjcl9+OTDNFwsO5wQx7bzuTOTSzlf1ZUqqy8cp7opgbnLu2/Yfvw6FOFXP+aZ+2ps/+bHQh8fk5rESX7RaLsc7SvZk4GAf23q/DfEGnwA8M+mSZxMM9BTdw+gSZoDwpf7t9P40mQptXKi/QO6d/v3H7Mk+/H3w/U3tXx1u4+J3d3DS+RFG25JLAisWn4xtdIF7pKRVSgkQHwM+u/5MheGuWgzS6R+PaghAECoHkAJSfstRSTn07It+QxW4bXmDnoroBwj5hWk0JcqiW64DzSJYV+G4Kb9ZtIcCvtrQBxRkmFJruMMmZn0yoEmzM2bHzlcvkesSvYjrASV5Hupj298S8OKUkHMnQ2sSBbiBe4fpdiU6ETk6fn3lobV2ILYCsuVS+NZ76Otmwf+yvoM5FQ1+I+tkJOPBD6He0I6u/dI9YXCK3FB5420bXdGS8vyaWRTMWh/kJXO+3QYEEMiWfcsirW3H8NnmdzzNaD19BSULy+9EWvuMp3+5bwiPMSxOi/k6ILXn3KwZ3+v3SlY7vrEsfnzKnbHivGlPQxfVLh4jAIlT5WVWBD7hkT3f8++a3DGm5ugHG64kwkzYF+990EQxaYtjA+6YFETwnVhdBjd7BHQeh/wg1x3wcXNrOuI14CKWY3Vb0UJio8Nyt8fPPf4NsAuJ3V1lSQB3Oow6immD60bVQzxGrqQ/S92vGVUMqb5234YX1mQRpB9UWSDzVYcrDy968wiaHOrvVJ0zjE1AkSMBhPyAV0jnFMMmSmVQ8Q7EeciwzYsnlFQTbBJwwuLV343D96Oc8c2g2ZDmIS7N9gLc9O2TwHnCR6Dv8D0U0qnnTPcBwtwn3psNv94bwKnM1whRXfm3aO7bMyYAWB7TscPY3YH+skKjufeeOkXV6EHJLSMu8RUVGfTs1wSNbZD2tmNE53IiKAxmrXKfO5eq0pYdqpcoCVrKjS2VfgV4NMhNSi5IeqiTuvgnMN9AGTVYquekSVkxqjF8ihpi6s6cYtjrEWweHI73D1Q7njPjAi3ytxwboVFaBuScaeh4NUqlGtQvYXW5zYjdflQc+HGN/M4unZGN37DYaLhrcMQegMowNbAWmvct4g7fbuifMiN88agbAeFakZ0e5dQdhUCIuW2LCSqfFMQfUK87C3vxdzyWcC7rDov1CKCCu1nXt9KQ+QIVwaZ78c1Gs9+XVbdPqOCAsqvVK/nY8zfi1AQL10NQw4nAHcNbTi/O3WwQp/sp6W6wdfNrUCxaDK8HoK+mKksMZaBuuiefAB/ZBxp8qFno8x4qFQhfbMhsu17ZLIFjWsE9U9gvQDAKuGDkTfzMQ7mH62g57ZlJZQMNqqKM0Sq7ies9hBjxai+XKV4JoS2UZRmBc4FJIZ8w9Yy+JGW0/I66K5cfuxez9L1frR3RMW3LHpEatjvlgZD3ve45vevs92QzIV2s4HCelC9v41MxdMmWsOBOiIe07pJ/vqyU4JbRnCgvEjI0wDA5FimxX+FqSE+VG2xRaSBuhRdyBVA7i3gCJ1qwZTTPqvBU6AG0GjHb9a7v7XJVIs9w0meqki1UnQKe/nByjeuj6lrHwcOI9lht0/WFg8EABoNw279NhTmSiUXv9sywoikd0FeBR4hJNbEyVJyoapFRr8+/66wMld3hlCG1t3OxRg8s+h6nBrey4b5viSyqn6JTU5FWbZhpSeWI6AIkCTpVAZab8DFB9BW/uoJpfj4Y/XioIqhpLdGtxjUhWu7l1+k2sAGlQi+P4MttM34o48KbPFWtHWGea3REDErS8BHH42tBuG33nh2l22NAcijX82I8SYvC8oV3pR6yCyeVCWZ9qFqUJNrxRJ3jbY60wC7xUR9vHQGjsgsgOg2yqhV0U02eF1ULeSMObCJJzdho5RkfcyHUhHVL41GnAjYzpy7QaQBm1qmyHsK5RmQt5gaXYrSEDz31I8WLIuXGYotKlNf64zTQZZdyvnE31XJ6nKAPGyZ3iKoElJZSYrHw1kOZ2jxaFHwLZgjXHn59ylafij3H5jhFP9a/7ieePg/OavuBcD6bPtj96peXuOg3kGpHi2pzf/dnbsjlOeyScux8mf/irzUyNeAsIa7NGn4ryvNlgeO89fYfxxU5u+8f2L0FicJTRnSvC4nXan1idAF+/r0B7TmfqIZYu0xCk0aOmeUXpZ1rQIS1qq7nkiAu4hL3Fdd/exbjeqs2vbUoIn7K0XALDrWIgijnpfZQNwB3hoM03wSZpIf+qoGGaJVLEL3cdxWLxXN6PV8LVu8WXPyAFgkpcnb499s+cxLffbcd3ZuOsThUOTmXtXz4KuXdbw3tXxbyzDd1dlkIB/HhdnWdSTPyP3gPg7tARv8nDiLOdHADWMMpV90i/eXnPwrl3hlqWUbZ5nmU3RBqHL67w9b3z3T7LR4JctD1yZ/BmM9NWau014sqFQSAO7DAje8/KkO8OYx5WuR3RuW4+ExOcnueMUSqRLz6iqyFmkaLORy/fY0ls1ziJk0laNfstoY14NbC0JfPiPX6jBGU3U8AiI48Bp/klowSvLEzmfePoNktPEd21OTgqP7qolPI5+LMIJRu/PHPskyPwGZziOIUq7O9ps64Qm6h29HbdlxJI6+ub21A4kwUUOBY8qZ26lYiITALyfGGj2DBu9PVXPtZo/1IW4m+YXp+xQC4ow8q07lM/zsYuYP0R2ETrviqO8fC0kCIQAiFyKlWGIEH2l8fQLL1XNJhKwPce/sZ7GtzuSEIDDfjQ5sE384lMr3X24GxPlSCM/fxahKCKVKunl1pf5UJQW67Hut+gWCppUSGnKG+r+3iJYGOlK1X2zHbXATe11I2Rtndz88PdslxFJp6GUtMSw2ekt4gpZwelScO0P8aFOgwStQ16e7PHuaCfPP3cPeIpCfKwUxRCRNWYCvziMLFtgAMPt0BqUJmDzhmTqU8aLREAeLhkfSfRf+aGkVh9SCcZVx1gdx6xaEyVDub4cpczvb75IjlEwAzF3xf9azLBDRoTTEKPxsBPO6l/f3x1I6PDuzgb5ncxeTjmcQ3zNHsSFDF4fOoGM+XECvQxKizaxInAJaOozlre/4U994urdFjdS5kydHdvUq2f+8mJCoDzJ6P11K6rTiapxu6wmk5jctCKybHW18IzLFyM9RXW44dvWoQ7BvEfiighFiSrhxcuLLzIvxE9Y7w+yWaJtoZXNijcIHpenv/LgbNyP3t1oIfr/kI7ZOVW0d5bXiygL4BI8tLaipN9Jk7WspleEOXIsfDkdtiwidFyIKzllChMZ7W2ofnN4lgRy6ANAl130O+LMuOEt2BRspVd1QYScFqmd2KmT+pBJtYQJkSJobSllLyBuOV+yKkLKWgguTnIpnIOT3IApP/hqlp998wiXV+E/l6gAXcUpQMwc681+iLf73T7IHAJNsODUBQ2lWmYvDUxvCAowfq8kh0CE9SlKpSjda/ORR6rkJAc9p05jl6a++tMq2ejLX/HxRTRZi3SKgpfPqN+Ojc2ZVHKHTl8gKxyjfgh+c+OL9Sg9F20hoLWhPwc1qaC7JPZ38+iffY197WntAPCDRzbq4ebaxdl0fh86jrzRj2YGuwspUNAACbc3pgtJHvQTSv1ixw9KpXME5809831Xi06Uy1ehhWrq4D6Q530lXmxopBL5UoIWtQa29l5tF5N8GxrwDePTNLQTg7S52/ZLdeaGZ219gowAI/G+fzOJ+7oK7ncFxfVL6LLs+aA7PKXPNSq6xcVi08uWt5nryAwqnJMXYV7YwWU5amXIK3Cd7gKkAcTBc30qj0tytQLKy7iJ+3tTC3RMOf5x/6SHerWyCY37DZoEFjblXBlxOOsekbpQZ2JDSpM/Z7bTV+shIiXebzRwAtQBWFSh3GjFckZrKKX25kKdMzwa1AUjOhi5J5iPbKw1mxoQbA1hVUDCFybUK7x65UYEz4nEcWdddhoadFKfqdN/BV7/BafsAAHpcd8zL0k7O+O8l6HHMy8ZB+hKJdqxWS9fx41NI3r3X7dfVRbaRUmPM1WG2MogVtzzyMHqFlJ7oVcLc7zWU9E2vRc7S98aQvNrH22Sv/ckEgjKz1yZWlvY6xG9tb4jc7e8NU7Q3vRGCmvqD81ik2dHp0m1Yr4SYuAwSPm5qkngPKKJZn2aGtqJvQEKnPtOua0JdplOv05LXNERqavSzFj/SXixaTtPM6N6YUpwhE5OoFGtKQWyhRusoNGHQbK+w3PMKjky3iDxpv7SAXvy+fDw8suurJaM5TTXZ9qPpSKtMvYi4NFHVQmK5s1hBg6IGTSu1aWEGQzJkysl20qJuSaqB5UpUjdmMgWZxZkDatYawEjkkvmgb+F6QMHF/0S8VmgI=) format('woff2')}
+:root{--font-mono:'JBMono','JetBrainsMono Nerd Font Mono','JetBrains Mono'}
+body,pre,code,input,button,textarea{font-family:var(--font-mono)}
+body,pre,code,input,button{font-weight:300}
+/* header: equal space above/below the bar, no hidden bottom border; date wraps under title */
+header{padding:28px 0 20px!important;gap:20px!important;border-bottom:0!important}
+.hdr-bar{margin-top:0!important}
+@media(max-width:900px){header{padding:22px 0 18px!important;gap:18px!important}}
+@media(max-width:560px){header{padding:18px 0 16px!important;gap:16px!important}}
+/* one-row headers (no stats row): white pills and white pager so the header keeps contrast */
+.hdr-deck:not(:has(.hdr-stats .kv)) .hdr-meta .kv{--pf:var(--paper)!important;--pi:var(--ink)!important}
+header:not(:has(.hdr-stats .kv)) .hdr-bar .parts a{background:var(--paper)!important;color:var(--ink)!important;border-color:var(--ink)!important}
+header:not(:has(.hdr-stats .kv)) .hdr-bar .parts a.current,header:not(:has(.hdr-stats .kv)) .hdr-bar .parts a:hover{background:var(--ink)!important;color:var(--paper)!important;border-color:var(--paper)!important}
+/* dates: not bold */
+.row-ts .ts-d{font-weight:300!important}
+/* TOC: section labels tabbed in to the item text; +/- 20px stroke 3 */
+aside .sec-hd{padding-left:14px!important}
+.sec-hd .sec-fold,.sec-hd .sec-fold svg{width:20px!important;height:20px!important}
+.sec-hd .sec-fold svg{stroke-width:3!important}
+/* metadata headers: label follows the row colour (visible when focused) */
+.meta-row .meta-hd .row-cmd{color:inherit!important}
+.meta-row .meta-hd{cursor:pointer}
+/* search: magnifying glass at text size, gone while typing */
+.toc-search::placeholder{color:transparent!important}
+.toc-search:placeholder-shown{background:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.25' stroke-linecap='round'><circle cx='10.5' cy='10.5' r='6.5'/><path d='M15.5 15.5l5 5'/></svg>") no-repeat 10px center/1.15em 1.15em}
+/* no giant empty space at the bottom */
+aside{height:auto!important;max-height:100vh!important;align-self:flex-start!important}
+.resizer{height:auto!important;align-self:stretch!important}
+section.content{padding-bottom:24px!important}
+/* scroll thumb: the glowing cascading chevrons, translated to monochrome (smooth, layered depth) */
+.scroll-thumb{animation:mb-glow 2.4s ease-in-out infinite!important}
+.scroll-thumb i{width:10px!important;height:10px!important;margin-top:-3px!important;border-right:3px solid var(--ink)!important;border-bottom:3px solid var(--ink)!important;opacity:0;filter:none!important;animation:mb-chev 1.6s ease-in-out infinite!important}
+.scroll-thumb i:first-child{margin-top:0!important}
+.scroll-thumb i:nth-child(2){animation-delay:.2s!important}.scroll-thumb i:nth-child(3){animation-delay:.4s!important}
+@keyframes mb-chev{0%{opacity:0;transform:translateY(-5px) rotate(45deg)}45%{opacity:1}100%{opacity:0;transform:translateY(6px) rotate(45deg)}}
+@keyframes mb-glow{0%,100%{filter:drop-shadow(0 0 1px #fff) drop-shadow(0 0 1px #fff) drop-shadow(0 0 4px rgba(0,0,0,.55)) drop-shadow(0 2px 7px rgba(0,0,0,.35))}
+ 50%{filter:drop-shadow(0 0 1.5px #fff) drop-shadow(0 0 2px #fff) drop-shadow(0 0 7px rgba(0,0,0,.8)) drop-shadow(0 3px 12px rgba(0,0,0,.5))}}
+@media(prefers-reduced-motion:reduce){.scroll-thumb,.scroll-thumb i{animation:none!important}.scroll-thumb i{opacity:1}}
+.out{font-size:13px!important}</style>
+</head>
+<body id="top">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs><g id="i-x"><path d="M6 18 18 6M6 6l12 12"/></g><g id="i-ch"><path d="M15.666 3.888A2.25 2.25 0 0 0 13.5 2.25h-3c-1.03 0-1.9.693-2.166 1.638m7.332 0c.055.194.084.4.084.612v0a.75.75 0 0 1-.75.75H9a.75.75 0 0 1-.75-.75v0c0-.212.03-.418.084-.612m7.332 0c.646.049 1.288.11 1.927.184 1.1.128 1.907 1.077 1.907 2.185V19.5a2.25 2.25 0 0 1-2.25 2.25H6.75A2.25 2.25 0 0 1 4.5 19.5V6.257c0-1.108.806-2.057 1.907-2.185a48.208 48.208 0 0 1 1.927-.184"/><path d="M9.75 10.5v6M14.25 10.5v6M9.75 13.5h4.5"/></g><g id="i-cc"><path d="M15.666 3.888A2.25 2.25 0 0 0 13.5 2.25h-3c-1.03 0-1.9.693-2.166 1.638m7.332 0c.055.194.084.4.084.612v0a.75.75 0 0 1-.75.75H9a.75.75 0 0 1-.75-.75v0c0-.212.03-.418.084-.612m7.332 0c.646.049 1.288.11 1.927.184 1.1.128 1.907 1.077 1.907 2.185V19.5a2.25 2.25 0 0 1-2.25 2.25H6.75A2.25 2.25 0 0 1 4.5 19.5V6.257c0-1.108.806-2.057 1.907-2.185a48.208 48.208 0 0 1 1.927-.184"/><path d="M8.25 11.25h7.5M8.25 14.25h7.5M8.25 17.25h4.5"/></g><g id="i-v"><path d="M12 4.5v15"/></g><g id="i-h"><path d="M19.5 12h-15"/></g></defs></svg>
+<header>
+<div class="hdr-top">
+<div class="hdr-brand">
+<svg class="icon" viewBox="0 0 24 24"><rect height="16" rx="1" width="20" x="2" y="4"></rect><path d="M6 9l3 3-3 3M12 15h6"></path></svg>
+<h1 class="hdr-title"><span class="hdr-script">@@SCRIPTNAME@@</span><span class="hdr-target">@@TARGETNAME@@</span><span class="meta-time-spacer" aria-hidden="true"><span><span>@@DATE@@</span><span>@@TIME@@</span></span></span></h1>
+</div>
+<div class="meta-time"><span>@@DATE@@</span><span>@@TIME@@</span></div>
+</div>
+<div class="hdr-deck">
+<div class="hdr-meta" aria-label="Host">@@HOSTINFO@@<!-- t82u description commented out: <button type="button" class="edit-description" title="Edit description" onclick="editDescription()">Edit</button> --></div>
+@@STATSDECK@@</div>
+<div class="hdr-bar">
+<!-- [2026-10-30 PDT] monoblock: accent selector commented out
+<div class="accent-switcher" role="group" aria-label="Accent color">
+<span class="accent-switcher__label">Accent</span>
+<button type="button" class="accent-dot active" data-accent="FF8383" style="background:#FF8383" title="#FF8383"></button>
+<button type="button" class="accent-dot" data-accent="FCD3FF" style="background:#FCD3FF" title="#FCD3FF"></button>
+<button type="button" class="accent-dot" data-accent="29AA99" style="background:#29AA99" title="#29AA99"></button>
+<button type="button" class="accent-dot" data-accent="15D8B3" style="background:#15D8B3" title="#15D8B3"></button>
+<button type="button" class="accent-dot" data-accent="7692FF" style="background:#7692FF" title="#7692FF"></button>
+<button type="button" class="accent-dot" data-accent="1A05A2" style="background:#1A05A2" title="#1A05A2"></button>
+</div>
+-->
+<div class="hdr-controls" role="group" aria-label="Document-wide controls">
+<button type="button" title="Scroll to bottom" onclick="window.scrollTo({top:document.documentElement.scrollHeight})"><svg class="icon hi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m19.5 8.25-7.5 7.5-7.5-7.5"/></svg></button>
+<button type="button" title="Delete all entries" onclick="deleteRows(rows(),this)"><svg class="icon hi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 18 18 6M6 6l12 12"/></svg></button>
+<button type="button" title="Copy all headers (shift = headers + content)" onclick="copyAll(this,event,true)"><svg class="icon hi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15.666 3.888A2.25 2.25 0 0 0 13.5 2.25h-3c-1.03 0-1.9.693-2.166 1.638m7.332 0c.055.194.084.4.084.612v0a.75.75 0 0 1-.75.75H9a.75.75 0 0 1-.75-.75v0c0-.212.03-.418.084-.612m7.332 0c.646.049 1.288.11 1.927.184 1.1.128 1.907 1.077 1.907 2.185V19.5a2.25 2.25 0 0 1-2.25 2.25H6.75A2.25 2.25 0 0 1 4.5 19.5V6.257c0-1.108.806-2.057 1.907-2.185a48.208 48.208 0 0 1 1.927-.184"/><path d="M9.75 10.5v6M14.25 10.5v6M9.75 13.5h4.5"/></svg></button>
+<button type="button" title="Copy all content (shift = headers + content)" onclick="copyAll(this,event,false)"><svg class="icon hi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15.666 3.888A2.25 2.25 0 0 0 13.5 2.25h-3c-1.03 0-1.9.693-2.166 1.638m7.332 0c.055.194.084.4.084.612v0a.75.75 0 0 1-.75.75H9a.75.75 0 0 1-.75-.75v0c0-.212.03-.418.084-.612m7.332 0c.646.049 1.288.11 1.927.184 1.1.128 1.907 1.077 1.907 2.185V19.5a2.25 2.25 0 0 1-2.25 2.25H6.75A2.25 2.25 0 0 1 4.5 19.5V6.257c0-1.108.806-2.057 1.907-2.185a48.208 48.208 0 0 1 1.927-.184"/><path d="M8.25 11.25h7.5M8.25 14.25h7.5M8.25 17.25h4.5"/></svg></button>
+<button type="button" class="gfold" title="Toggle all outputs" onclick="toggleAllOutputs(this)"><svg class="icon hi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path class="pm-v" d="M12 4.5v15"/><path d="M19.5 12h-15"/></svg></button>
+</div>
+</div>
+</header>
+
+<!-- Pager lane: written before <main> so the open part has it while rows stream in; page open moves it below <main>. -->
+<div class="parts-lane" data-pre>@@PARTS@@</div>
+<div class="scroll-rail" id="scroll-rail" aria-hidden="true"><div class="scroll-thumb" id="scroll-thumb"><i></i><i></i><i></i></div></div>
+
+<!-- t82u description commented out: <dialog id="description-dialog"><label for="description-input">Description (optional)</label><input id="description-input" type="text" autocomplete="off"><div><button id="description-cancel">Cancel</button><button id="description-save">Save</button></div></dialog> -->
+<dialog id="delete-dialog"><p id="delete-question"></p><button id="delete-cancel" autofocus>Cancel</button><button id="delete-confirm">Delete from report</button></dialog>
+<main>
+<aside>
+<input class="toc-search" id="tocSearch" placeholder="&#x2315;" aria-label="Search index" type="text"/>
+<nav class="toc" id="tocNav"></nav>
+
+</aside>
+
+<div class="resizer" id="resizer" role="separator" aria-label="Index width" aria-orientation="vertical" tabindex="0" title="Drag to resize"></div>
+
+<section class="content">@@CARDS@@
+<!--ROWS--></section>
+</main>
+</body>
+</html>
+"""
+BUTTONS = r"""<div class="icon-cluster">
+<button class="btn-del" title="Delete entry" onclick="deleteRow(this)"><svg class="icon hi" viewBox="0 0 24 24"><use href="#i-x"/></svg></button>
+<button class="btn-in" title="Copy header (shift = header + content)" onclick="copyInput(this,event)"><svg class="icon hi" viewBox="0 0 24 24"><use href="#i-ch"/></svg></button>
+<button class="btn-out" title="Copy content (shift = header + content)" onclick="copyOutput(this,event)"><svg class="icon hi" viewBox="0 0 24 24"><use href="#i-cc"/></svg></button>
+<button class="btn-fold" title="Collapse output" onclick="toggleOutput(this)"><svg class="icon hi" viewBox="0 0 24 24"><use class="pm-v" href="#i-v"/><use href="#i-h"/></svg></button>
+</div>"""
+
+META_BUTTONS = r"""<div class="icon-cluster">
+<button class="btn-out" title="Copy content (shift = header + content)" onclick="copyOutput(this,event)"><svg class="icon hi" viewBox="0 0 24 24"><use href="#i-cc"/></svg></button>
+<button class="btn-fold" title="Collapse output" onclick="toggleOutput(this)"><svg class="icon hi" viewBox="0 0 24 24"><use class="pm-v" href="#i-v"/><use href="#i-h"/></svg></button>
+</div>"""
+
+# ── blast25 streaming renderer ───────────────────────────────────────────────
+# [2026-10-27 PDT] blast25: live append (rev6). Frames on stdin, NUL-separated:
+#   B header ts_display iso   open a row (written at once: header first, output streams in)
+#   C bytes                   output bytes for the open row (appended as they arrive)
+#   E                         close the open row
+#   X rc                      exit code of the command whose rows were opened since the last X
+#   S                         sync: reply on stdout with "P <path>" per part opened since the last sync, then "K"
+#   Q                         finish now (exit), reply "D <entries>\t<html>\t<json>"
+# The renderer never prints to the terminal; blast prints its own lines (-> path, saved ...) in blast24's places.
+# [2026-10-27 PDT] t83u blast25s ROTATION: before a row, rotate once the open part's real bytes reach the
+# target (20 MB). While a row streams, the next piece of output (pieces end at a line break) that would push
+# the open part past the hard cap (target + 50% = 30 MB) splits the row there: the row and the part are closed,
+# and the same row (same id, time and header) continues in the next part. No part passes 30 MB. A row whose
+# header is in the part but has no output there yet is moved whole instead (no empty row is left behind).
+import signal,codecs
+for _sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP): signal.signal(_sig,signal.SIG_IGN)   # parts close on EOF, never mid-write
+def main():
+    (outdir,base,name,zsh_version,source,target,favicon,target_bytes,description,settings_json,
+     os_name,os_version,os_build,model_id,model_number,chip,memory,firmware,host_full)=sys.argv[1:20]
+    settings=json.loads(settings_json)
+    limits={'output_font_px':(6,48),'output_line_height':(1,4),'row_font_px':(6,48),'timestamp_font_px':(6,48),'toc_font_px':(6,48),'maximum_indent_percent':(0,50),'part_columns':(1,10),'part_button_width_px':(16,96),'part_button_height_px':(16,96),'scroll_duration_ms':(0,2000),'output_block_chars':(256,1048576)}
+    for key,(low,high) in limits.items():
+        value=settings[key]
+        if isinstance(value,bool) or not isinstance(value,(int,float)) or not low<=value<=high:raise ValueError('Invalid report setting: '+key)
+    block_chars=int(settings['output_block_chars']);collapse=bool(settings['collapse_outputs_initially'])
+    target_bytes=int(target_bytes);hard_cap=target_bytes+target_bytes//2
+    outdir=Path(outdir);esc=html.escape
+    started=datetime.now().astimezone()
+    # blast's own host pills (blast24 fields and order)
+    host=[(os_name,(os_version+' '+os_build).strip()),('MODEL',' '.join(filter(None,[model_id,model_number]))),
+          ('MEMORY',' '.join(filter(None,[re.sub(r'\s+(?=[KMGT]B\b)','',memory),chip]))),('HOST',host_full),
+          ('System Firmware Version',firmware),('ZSH',zsh_version)]
+    host_markup=''.join('<div class="kv"><span class="k">'+esc(k)+'</span><span class="v">'+esc(v or 'Unknown')+'</span></div>' for k,v in host)
+    hostname=dict(host).get('HOST','') or platform.node()
+    # blast's own config pane, shown as the Config metadata row (last row of every part).
+    lines=Path(source).read_text().splitlines(keepends=True)
+    b=[i for i,l in enumerate(lines) if l.startswith('# BEGIN REPORT CONFIG')];e=[i for i,l in enumerate(lines) if l.startswith('# END REPORT CONFIG')]
+    config=''.join(lines[b[0]:e[0]+1]) if len(b)==1 and len(e)==1 and e[0]>b[0] else ''
+    # [2026-10-27 PDT] t82u: description commented out (pill/box in the header; prompt, Edit button and dialog too).
+    # deck=('<div class="hdr-stats description-row" id="report-description-row"'+('' if description.strip() else ' hidden')+
+    #       '><div class="kv description-pill"><span class="v path" id="report-description">'+esc(description)+'</span></div></div>\n')
+    deck=''
+    common={'TITLE':esc(name+': '+hostname),'SCRIPTNAME':esc(name),'TARGETNAME':esc(hostname),'HOSTINFO':host_markup,
+            'FAVICON':esc(favicon,quote=True),'DATE':display_date(started),'TIME':display_time(started),'STATSDECK':deck}
+    head_tpl,tail_tpl=TEMPLATE.split('<!--ROWS-->',1)
+    tail=tail_tpl.encode('utf-8')
+    # blast naming: part 1 = <base>.html, part N = <base>_pN.html (JSON alongside, same stem).
+    def stem(n): return base+('' if n==1 else f'_p{n}')
+    def part_path(n): return outdir/(stem(n)+'.html')
+    def json_path(n): return outdir/(stem(n)+'.json')
+    def navigation(cur,total):
+        return (f'<nav class="parts" aria-label="Report parts" data-base="{esc(quote(base),quote=True)}" data-cur="{cur}" data-total="{total}" style="--part-columns:{min(10,total)}">'+
+                ''.join(f'<a class="{"current" if i==cur else ""}" href="{esc(quote(stem(i)+".html"),quote=True)}"'+(' aria-current="page"' if i==cur else '')+f' title="Part {i} of {total}">{i}</a>' for i in range(1,total+1))+'</nav>')
+    S={'part':0,'size':0,'rows_in_part':0,'row':None,'stamp':[],'total_rows':0,'f':None,'j':None,'jfirst':True,'rc':{},'opened':[]}
+    def w(data):
+        S['f'].write(data);S['f'].flush();S['size']+=len(data)
+    def jw(text):
+        S['j'].write(text.encode('utf-8'));S['j'].flush()
+    def open_part():
+        S['part']+=1;n=S['part']
+        tokens=dict(common,CARDS='<p id="nofiles">No commands recorded.</p>',PARTS=navigation(n,n))
+        head=re.sub(r'@@([A-Z]+)@@',lambda m:tokens[m[1]],head_tpl).encode('utf-8')
+        S['f']=part_path(n).open('wb');S['size']=0;S['rows_in_part']=0;w(head)
+        S['j']=json_path(n).open('wb');S['jfirst']=True;S['rc']={}
+        jw(json.dumps({'run_id':base,'host':hostname,'part':n,'started':datetime.now().astimezone().isoformat(),'description':description},ensure_ascii=False)[:-1]+',"entries":[')
+        S['opened'].append(str(part_path(n)))
+    def close_part(next_exists):
+        # Final for this part: Config metadata row, pager (with the next part when one follows), closing tags.
+        n=S['part']
+        cfg=('<div class="row metadata-item meta-row" id="metadata-config-p'+str(n)+'" data-copy-path="config"><div class="row-hd meta-hd"><span class="row-cmd">config</span>'+META_BUTTONS+
+             '</div><div class="row-output"><div class="out"><pre class="ln">'+esc(config)+'</pre></div></div></div>\n')
+        w(cfg.encode('utf-8'))
+        w(('<script>__u('+json.dumps({'parts':n+1 if next_exists else n})+')</script>\n').encode('utf-8')+tail)
+        S['f'].close()
+        jw('],"exit_codes":'+json.dumps(S['rc'])+',"entry_count":'+str(S['rows_in_part'])+',"ended":'+json.dumps(datetime.now().astimezone().isoformat())+'}\n');S['j'].close()
+    reserve=len(tail)+len(config)*2+4096
+    def row_write_start():
+        # Card head + JSON entry head of the open row, into the open part. Remembers where the row begins.
+        r=S['row']
+        r['hpos']=S['size'];r['jpos']=S['j'].tell();r['alone']=S['rows_in_part']==0
+        card=('<div class="row'+(' collapsed' if collapse else '')+'" id="'+r['id']+'" data-copy-path="'+esc(r['hdr'],quote=True)+'"><div class="row-hd"><div class="row-strip"><span class="row-ts"><b class="ts-d">'+esc(['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][int(r['iso'][5:7])-1]+' '+r['iso'][8:10]+' '+r['iso'][2:4])+'</b>&nbsp;&nbsp;'+esc(r['tsd'])+'</span>'+BUTTONS+
+              '</div><div class="row-cmd">'+esc(r['hdr'])+'</div></div><div class="row-output"><div class="out"><pre class="ln">').encode('utf-8')
+        jhead=('' if S['jfirst'] else ',')+json.dumps({'id':r['id'],'ts':r['iso'],'ts_display':r['tsd'],'command':r['hdr']},ensure_ascii=False)[:-1]+',"output":"'
+        w(card);jw(jhead);S['rows_in_part']+=1;S['jfirst']=False
+        r['out']=0
+    def row_open(hdr,tsd,iso):
+        S['total_rows']+=1;ident=f'row-{S["total_rows"]}'
+        S['row']={'hdr':hdr,'tsd':tsd,'iso':iso,'id':ident,'chars':0,'blk':0,'span':False,'dec':codecs.getincrementaldecoder('utf-8')('replace'),'pend':''}
+        row_write_start();S['stamp'].append(ident)
+    def move_row():
+        # The row has only its header in this part: cut it back, close the part, start the row in the next part.
+        r=S['row']
+        S['f'].truncate(r['hpos']);S['f'].seek(r['hpos']);S['size']=r['hpos']
+        S['j'].truncate(r['jpos']);S['j'].seek(r['jpos']);S['rows_in_part']-=1
+        S['jfirst']=S['rows_in_part']==0
+        close_part(True);open_part()
+        row_write_start()                      # same id, header and time; now the part's first row
+    def split_row():
+        # blast25s: close the row here, close the part, and continue the same row in the next part.
+        r=S['row']
+        w((('</span>' if r['span'] else '')+'</pre></div></div></div>\n').encode('utf-8'));jw('"}')
+        close_part(True);open_part()
+        r['chars']=0;r['blk']=0;r['span']=False
+        row_write_start()                      # same id, header and time; now the part's first row
+    def emit(text):
+        # Escape and append one piece of the open row (pieces end at a line break except a forced flush).
+        r=S['row']
+        if not text: return
+        if S['size']+len(esc(text).encode('utf-8'))+64+reserve>hard_cap:
+            if r['out']: split_row()
+            elif not r['alone']: move_row()
+        pre=''
+        if r['chars']>=block_chars and not r['span']: pre='<span class="render-block">';r['span']=True;r['blk']=0
+        post=''
+        r['chars']+=len(text);r['blk']+=len(text)
+        if r['span'] and r['blk']>=block_chars and text.endswith('\n'): post='</span>';r['span']=False
+        data=pre.encode()+esc(text).encode('utf-8')+post.encode();jt=json.dumps(text,ensure_ascii=False)[1:-1]
+        w(data);jw(jt);r['out']+=len(data)
+    def feed(raw,final=False):
+        r=S['row'];r['pend']+=r['dec'].decode(raw,final)
+        p=r['pend']
+        if final: cut=len(p)
+        else:
+            cut=p.rfind('\n')+1
+            if cut==0 and len(p)>65536: cut=len(p)     # very long line with no break yet: flush it
+        while cut>0:
+            # keep each appended piece around 64K chars so the cap check happens often
+            k=min(cut,65536)
+            if k<cut:
+                nl=p.rfind('\n',0,k)
+                if nl>0: k=nl+1
+            emit(p[:k]);p=p[k:];cut-=k
+        r['pend']=p
+    def row_end():
+        if S['row'] is None: return
+        feed(b'',final=True)
+        r=S['row']
+        w((('</span>' if r['span'] else '')+'</pre></div></div></div>\n').encode('utf-8'));jw('"}')
+        S['row']=None
+    def reply(line):
+        try: sys.stdout.write(line+'\n');sys.stdout.flush()
+        except Exception: pass
+    open_part()
+    fields=read_fields_bytes(sys.stdin.buffer)
+    for kind in fields:
+        if kind==b'B':
+            hdr=next(fields,b'').decode('utf-8','replace');tsd=next(fields,b'').decode();iso=next(fields,b'').decode()
+            row_end()
+            if S['rows_in_part'] and S['size']>=target_bytes:
+                close_part(True);open_part()
+            row_open(hdr,tsd,iso)
+        elif kind==b'C':
+            data=next(fields,b'')
+            if S['row'] is not None: feed(data)
+        elif kind==b'E':
+            row_end()
+        elif kind==b'X':
+            rc=int(next(fields,b'0') or 0)
+            for ident in S['stamp']: S['rc'][ident]=rc
+            if rc: w(('<script>__rc('+json.dumps(S['stamp'])+','+str(rc)+')</script>\n').encode('utf-8'))
+            S['stamp']=[]
+        elif kind==b'S':
+            for path in S['opened']: reply('P '+path)
+            S['opened']=[];reply('K')
+        elif kind==b'Q':
+            break
+    row_end();close_part(False)
+    reply('D '+str(S['total_rows'])+'\t'+str(part_path(S['part']))+'\t'+str(json_path(S['part'])))
+
+def read_fields_bytes(stream):
+    # NUL-framed fields. C payloads have their NUL bytes removed by the copier.
+    buf=b''
+    while True:
+        chunk=stream.read1(1<<20)
+        if not chunk: break
+        buf+=chunk
+        *done,buf=buf.split(b'\0')
+        for item in done: yield item
+    if buf: yield buf
+
+try: main()
+except Exception as e:
+    print(f'report error: {e}',file=sys.stderr)
+    try:
+        while sys.stdin.buffer.read(65536): pass
+    except Exception: pass
+    sys.exit(1)
+
+BLAST_ENGINE_END
+IFS= read -r -d '' BLAST_COPIER_PY <<'BLAST_COPIER_END'
+# blast25 copier: one per command. Reads the command's output (stdin, a pipe), copies every byte to the
+# terminal at once (the tee), and streams it to the renderer as frames on fd 3. Loop commands are split
+# live into one row per item with blast's own rule (a bare absolute path alone on its line at brace depth 0
+# starts an item; no item -> one row for the command).
+# [2026-10-27 PDT] output before the first item streams live into a row headed by the command itself
+# (blast24 joined it to item 1 at the end; holding it back meant nothing was live until an item appeared).
+import os,sys,re,signal
+for _sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP): signal.signal(_sig,signal.SIG_IGN)
+header,tsd,iso,loop,verb=sys.argv[1:6]
+loop=loop=='1'
+term=sys.stdout.buffer;rep=os.fdopen(3,'wb');tty_ok=True
+def tee(b):
+    # terminal copy; a closed terminal must not stop the report copy
+    global tty_ok
+    if not tty_ok: return
+    try: term.write(b);term.flush()
+    except OSError: tty_ok=False
+def frame(*f):
+    rep.write(b''.join(x.replace(b'\0',b'')+b'\0' for x in f));rep.flush()
+H=header.encode('utf-8','surrogateescape');T=tsd.encode();I=iso.encode()
+fd=sys.stdin.fileno()
+if not loop:
+    frame(b'B',H,T,I)
+    while True:
+        chunk=os.read(fd,65536)
+        if not chunk: break
+        tee(chunk);frame(b'C',chunk)
+    frame(b'E')
+    sys.exit(0)
+n=0;depth=0;buf=b'';opened=False;pre_row=False
+V=verb.encode('utf-8','surrogateescape')
+TOK=re.compile(rb'[{}\[\]]')
+def lines_out(lines):
+    global n,depth,opened,pre_row
+    out=[]
+    for line in lines:
+        label=line.strip(b' \t\r\n')
+        if depth==0 and label.startswith(b'/') and b'\t' not in label:
+            if opened or pre_row:
+                if out: frame(b'C',b''.join(out));out=[]
+                frame(b'E');pre_row=False
+            n+=1;frame(b'B',(V+b' '+label) if V else label,T,I);opened=True
+        elif not opened and not pre_row:
+            frame(b'B',H,T,I);pre_row=True
+        out.append(line)
+        for t in TOK.finditer(line):
+            depth=depth+1 if t[0] in (b'{',b'[') else max(0,depth-1)
+    if out: frame(b'C',b''.join(out))
+while True:
+    chunk=os.read(fd,65536)
+    if not chunk: break
+    tee(chunk)
+    buf+=chunk
+    parts=buf.split(b'\n')
+    buf=parts.pop()                                      # partial last line waits for its line break
+    lines=[x+b'\n' for x in parts]
+    if len(buf)>1<<20: lines.append(buf);buf=b''          # very long unbroken line: pass it on as is
+    lines_out(lines)
+if buf: lines_out([buf])
+if not opened and not pre_row:
+    frame(b'B',H,T,I)
+frame(b'E')
+
+BLAST_COPIER_END
+BLAST_FD=""; BLAST_IN=""; BLAST_PID=""
+# Renderer: one long-lived python (coproc). It never writes to the terminal: it answers blast on its stdout
+# (BLAST_IN) and blast prints "-> <part>" and "saved ..." itself, synchronously, where blast24 printed them.
+# SIGINT is ignored so Ctrl-C never kills the report mid-write.
+blast_report_begin() {
+  coproc { trap '' INT; exec python3 -u -c "$BLAST_ENGINE_PY" "$FX_ROOT" "$BASE" "$SCRIPT_NAME" "$ZSH_VERSION" \
+      "$SCRIPT_PATH" "$B21_START_DIR" "$BLAST_FAVICON" "$ROTATE_BYTES" "$REPORT_DESCRIPTION" "$REPORT_SETTINGS" \
+      "$SYS_OS_NAME" "$SYS_OS_VERSION" "$SYS_OS_BUILD" "$SYS_MODEL_ID" "$SYS_MODEL_NUMBER" "$SYS_CHIP" \
+      "$SYS_MEMORY" "$SYS_FIRMWARE" "$HOSTNAME_FULL" 2>&$B19_STDERR }
+  BLAST_PID=$!
+  exec {BLAST_FD}>&p
+  exec {BLAST_IN}<&p
+  coproc :   # release the shell's coproc pipes; BLAST_FD is now the renderer's only writer
+  blast_sync
+}
+blast_rc() { [[ -n $BLAST_FD ]] && print -rn -u $BLAST_FD -- "X"$'\0'"$1"$'\0'; }
+# Sync with the renderer: prints "-> <path>" for every part opened since the last sync (blast24's line).
+blast_sync() {
+  [[ -n $BLAST_FD ]] || return 0
+  print -rn -u $BLAST_FD -- "S"$'\0' 2>/dev/null || return 0
+  local b25_line
+  while IFS= read -r -u $BLAST_IN b25_line; do
+    case $b25_line in
+      'P '*) printf -- '-> %s\n' "${b25_line#P }" ;;
+      K) break ;;
+    esac
+  done
+}
+blast_report_end() {
+  [[ -n $BLAST_FD ]] || return 0
+  # Q: finish now (a background job may still hold a copy of the pipe, so EOF alone could wait on it)
+  local b25_line b25_done=""
+  print -rn -u $BLAST_FD -- "Q"$'\0' 2>/dev/null
+  exec {BLAST_FD}>&-; BLAST_FD=""
+  while IFS= read -r -u $BLAST_IN b25_line; do
+    [[ $b25_line == 'D '* ]] && { b25_done=${b25_line#D }; break; }
+  done
+  exec {BLAST_IN}<&-; BLAST_IN=""
+  wait $BLAST_PID 2>/dev/null
+  if [[ -n $b25_done ]]; then
+    local -a b25_f; b25_f=("${(@ps:\t:)b25_done}")
+    printf '\nsaved %s entries\n  html: %s\n  json: %s\n' "${b25_f[1]}" "${b25_f[2]}" "${b25_f[3]}"
+  fi
+}
+
+# ── traps ──────────────────────────────────────────────────────────────
+cleanup() {
+  local b19_exit=$?
+  # exit/TERM inside eval may reach EXIT while descriptors still point at the copier.
+  if [[ $B19_ACTIVE == 1 ]]; then
+    exec 1>&$B19_STDOUT 2>&$B19_STDERR
+    coproc :
+    wait "$B19_TEE_PID" 2>/dev/null
+    B19_ACTIVE=0
+    blast_rc "$b19_exit"
+  fi
+  [[ -n $B19_TTY_ORIGINAL ]] && stty "$B19_TTY_ORIGINAL" </dev/tty
+  blast_report_end      # renderer closes any open row, appends Config + pager + closing tags to the open part
+  return "$b19_exit"
+}
+trap cleanup EXIT
+trap 'B19_INTERRUPTED=1; if [[ $B19_READING == 1 ]]; then return 130; fi' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# ── loop detection (item 13) ─────────────────────────────────────────
+# Detects the two patterns from the spec: `find ... -exec ...` and
+# `for/while ... find|ls ... do ... done`. This heuristic is carried
+# over as-is from a prior working script (tlog4) rather than invented
+# fresh — it's proven, not new.
+is_per_item_loop() {
+  local cmd="$1"
+  if printf '%s' "$cmd" | grep -qE '(^|[[:space:];])find[[:space:]].*-exec[[:space:]]'; then return 0; fi
+  if printf '%s' "$cmd" | grep -qE '(^|[[:space:];])(for|while)[[:space:]]'; then return 0; fi
+  return 1
+}
+
+# Splits a chunk of already-captured output into per-item pieces on the
+# same boundary tlog4 used successfully: a bare absolute path alone on
+# its own line (e.g. what `find -exec ... \;` or `plutil -p <path>`
+# naturally print as each item starts). Anything before the first such
+# line in this chunk is treated as a continuation of whatever item was
+# still open from an earlier chunk (tracked by the splitter).
+#
+# A bare path line only counts as a NEW item boundary when it appears
+# at brace/bracket depth 0 — i.e. between items, not inside one. This
+# matters because plutil -p renders some plist value types (CFURL, some
+# data blobs) as a bare, unquoted path on its own line WITHIN an
+# item's output (e.g. an "Owners" or CFURL-typed value nested inside
+# the dict) — without depth tracking, that inner line was
+# indistinguishable from the next item's real -print path, and a
+# single item's dump got chopped into two mislabeled fragments (both
+# showing the same path, output scrambled). Depth state persists across
+# splitter calls the same way item_n does, since a chunk can end
+# mid-structure.
+#
+# This only recognizes loops whose iterated tool announces a path per
+# item — that covers the plist/plutil case in the spec and most
+# find -exec find/ls patterns, but not every conceivable loop body.
+# Resolves a command's underlying definition if it's a shell function or
+# alias, so the loop detector can see inside wrapper functions like
+# plup_globalpref (whose actual find/while loop lives in the function
+# body, not in the four words typed at the prompt). Falls back to the
+# literal command text for anything that isn't a function/alias — an
+# inline `find ... -exec` still detects exactly as before.
+resolve_for_detection() {
+  local cmd="$1"
+  local head_word body=""
+  head_word=$(printf '%s' "$cmd" | awk '{print $1; exit}')
+  [ -z "$head_word" ] && { printf '%s' "$cmd"; return; }
+
+  body=$(functions -- "$head_word" 2>/dev/null)
+  if [ -n "$body" ]; then
+    printf '%s' "$body"
+  else
+    printf '%s' "$cmd"
+  fi
+}
+
+# Extracts the "verb" applied to each item inside a per-item loop -- e.g.
+# for find "$dir" -type f -name '*.plist' -exec plutil -p {} \; this
+# returns "plutil -p", the command template minus the trailing {}/\;/+
+# placeholder. Falls back to "" (caller then shows the bare path only,
+# same as before) if no recognizable verb can be isolated. This is what
+# was missing: split_loop_output correctly finds each item's path, but
+# the label was never combined with the verb that acts on it (bug 13.5).
+resolve_loop_verb() {
+  local body="$1"
+  local verb=""
+
+  verb=$(printf '%s' "$body" | tr '\n' ' ' | \
+    sed -n 's/.*-exec[[:space:]]\{1,\}\(.*\)[[:space:]]\{1,\}{}.*/\1/p' | head -1)
+
+  if [ -z "$verb" ]; then
+    verb=$(printf '%s' "$body" | awk '
+      /(^|[[:space:];])do([[:space:];]|$)/ { indo=1 }
+      indo && !/^[[:space:]]*(sudo[[:space:]]+|time[[:space:]]+|env[[:space:]]+|command[[:space:]]+)*(find|while|for|do|done|if|then|fi|elif|else)([[:space:];]|$)/ && NF {
+        line=$0
+        sub(/^[[:space:]]*/, "", line)
+        print line
+        exit
+      }
+    ')
+    verb=$(printf '%s' "$verb" | sed -E 's/[[:space:]]*("?\$[A-Za-z_{][A-Za-z0-9_}]*"?|\{\}).*$//')
+  fi
+
+  verb="${verb#"${verb%%[![:space:]]*}"}"
+  verb="${verb%"${verb##*[![:space:]]}"}"
+  printf '%s' "$verb"
+}
+
+# ── command execution helper ────────────────────────────────────────
+# 2026-09-29: foreground execution in THIS zsh, with one blocking byte copier.
+# Internal names are prefixed so normal user variables survive between commands.
+# 2026-09-30: contain return in the current process; EXIT still records real status.
+execute_input() {
+  builtin eval "$1"
+}
+
+run_cmd() {
+  local b19_cmd="$1"
+  [[ -n ${b19_cmd//[[:space:]]/} ]] || return 0
+  local b19_iso=$(date "+%Y-%m-%dT%H:%M:%S%z")
+  local b19_display=$(date "+%I:%M %p")   # [2026-10-27 PDT] t82u: row time = hh:MM AM/PM (plp-h/rgq/fqdv/condump)
+  local b19_detection=$(resolve_for_detection "$b19_cmd")
+  local b19_loop=0 b19_verb=""
+  if is_per_item_loop "$b19_detection"; then
+    b19_loop=1
+    b19_verb=$(resolve_loop_verb "$b19_detection")
+  fi
+  B19_CMD="$b19_cmd"
+  # [2026-10-27 PDT] blast25: the copier (tee) is a coproc: terminal copy + live frames to the renderer.
+  # Ctrl-C is ignored in the copier so it drains output after the foreground command is interrupted.
+  coproc { trap '' INT; exec python3 -u -c "$BLAST_COPIER_PY" "$b19_cmd" "$b19_display" "$b19_iso" "$b19_loop" "$b19_verb" \
+           >&$B19_STDOUT 2>&$B19_STDERR 3>&$BLAST_FD }
+  B19_TEE_PID=$!
+  B19_ACTIVE=1
+  B19_INTERRUPTED=0
+  B19_TTY_RUN=""
+  [[ -n $B19_TTY_ORIGINAL ]] && B19_TTY_RUN=$(stty -g </dev/tty)
+  [[ $B19_ALIAS_OPTION == on ]] && setopt aliases
+  # This function boundary contains `return` without creating a child shell.
+  # >&p (zsh's own coproc fd, closed in child processes): a background job the command starts can't hold the pipe open
+  execute_input "$b19_cmd" >&p 2>&1
+  local b19_rc=$?
+  B19_ALIAS_OPTION=$options[aliases]
+  unsetopt aliases
+  [[ $B19_INTERRUPTED == 1 ]] && b19_rc=130
+  B19_INTERRUPTED=0
+  coproc :   # closes the shell's end of the copier pipe: the copier sees EOF and finishes the row
+  wait "$B19_TEE_PID"
+  B19_ACTIVE=0
+  B19_TEE_PID=""
+  blast_rc "$b19_rc"
+  blast_sync      # a part opened during this command prints "-> <path>" here, after its output (blast24's place)
+  if [[ -n $B19_TTY_RUN ]]; then
+    stty "$B19_TTY_RUN" </dev/tty
+  fi
+  CUR_DIR="$PWD"
+  return 0
+}
+
+# ── syntax check helper ────────────────────────────────────────────────
+is_complete() {
+  # Syntax check only: -f suppresses startup files, -n executes nothing.
+  printf '%s\n' "$1" | "$SHELL_BIN" -fn >/dev/null 2>&1
+}
+
+# A function boundary lets SIGINT return from zsh's otherwise-restarted tty read.
+read_input() {
+  IFS= read -r line
+}
+
+# ── prompt + ingest ────────────────────────────────────────────────────
+# [2026-10-27 PDT] t82u: description commented out.
+# if [[ -t 0 && -z ${CAST_DESCRIPTION+x} ]]; then
+#   printf 'Report description (optional; Enter to skip): ' >/dev/tty
+#   IFS= read -r REPORT_DESCRIPTION || REPORT_DESCRIPTION=""
+# fi
+blast_report_begin
+
+# Check if stdin is a terminal (interactive) or piped (batch)
+if [ -t 0 ]; then
+  # Interactive mode: read line-by-line with prompt
+  echo "=== $SCRIPT_NAME logger running. Type 'exit' or Ctrl-D to finish. ==="
+  CMD_BUFFER=""
+  while true; do
+    # Print prompt directly to tty so it never mixes into input
+    if [ -z "$CMD_BUFFER" ]; then
+      printf '%s %s %s > ' "$(date '+%b %d')" "$(date '+%I:%M %p')" "$CUR_DIR" >/dev/tty
+    else
+      printf '> ' >/dev/tty
+    fi
+
+    B19_READING=1
+    read_input
+    read_rc=$?
+    B19_READING=0
+
+    # Ctrl-C cancels current input; Ctrl-D ends the logger.
+    if [[ $B19_INTERRUPTED == 1 ]]; then
+      B19_INTERRUPTED=0
+      CMD_BUFFER=""
+      printf '\n'
+      continue
+    fi
+    # Ctrl-D (EOF): reject incomplete buffered input, then exit
+    if [ $read_rc -ne 0 ] && [ -z "$line" ]; then
+      if [ -n "$CMD_BUFFER" ]; then
+        print -u2 "$SCRIPT_NAME: incomplete input was not executed"
+      fi
+      break
+    fi
+
+    # 'exit' command on empty buffer
+    if [ "$line" = "exit" ] && [ -z "$CMD_BUFFER" ]; then
+      break
+    fi
+
+    # Accumulate line into buffer
+    if [ -n "$CMD_BUFFER" ]; then
+      CMD_BUFFER="${CMD_BUFFER}"$'\n'"${line}"
+    else
+      CMD_BUFFER="$line"
+    fi
+
+    # Skip buffer that is only whitespace
+    trimmed="${CMD_BUFFER// /}"
+    trimmed="${trimmed//$'\t'/}"
+    trimmed="${trimmed//$'\n'/}"
+    [ -z "$trimmed" ] && { CMD_BUFFER=""; continue; }
+
+    # Check if buffer is a syntactically complete command
+    if is_complete "$CMD_BUFFER"; then
+      run_cmd "$CMD_BUFFER"
+      CMD_BUFFER=""
+    fi
+  done
+else
+  # Non-interactive mode: read all from stdin (piped input) — batch behavior
+  echo "=== $SCRIPT_NAME: processing piped input ==="
+  accum=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ -z "$accum" ]; then
+      accum="$line"
+    else
+      accum="${accum}"$'\n'"${line}"
+    fi
+    trimmed="${accum// /}"
+    trimmed="${trimmed//$'\t'/}"
+    trimmed="${trimmed//$'\n'/}"
+    [ -z "$trimmed" ] && { accum=""; continue; }
+
+    if is_complete "$accum"; then
+      run_cmd "$accum"
+      accum=""
+    fi
+  done
+
+  # Leftover (genuinely unterminated input)
+  if [ -n "$accum" ]; then
+    trimmed="${accum// /}"
+    trimmed="${trimmed//$'\t'/}"
+    trimmed="${trimmed//$'\n'/}"
+    if [ -n "$trimmed" ]; then
+      printf '\n[%s] %s (unterminated input)\n' \
+        "$(date "+%H:%M:%S")" "$(printf '%s' "$accum" | head -1)"
+      print -u2 "$SCRIPT_NAME: incomplete input was not executed"
+    fi
+  fi
+fi
+
