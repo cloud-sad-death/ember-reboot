@@ -21,7 +21,7 @@ Ember: a native, GPU-rendered macOS terminal (daily driver) that runs the user's
 ## CI fix (2026-06)
 - Root cause of empty GitHub Actions tab: workflow was at `ember/.github/workflows/macos.yml` but repo root is `/app`. GitHub only discovers workflows at `<root>/.github/workflows/`.
 - Fix: moved workflow to `/app/.github/workflows/macos.yml` with `defaults.run.working-directory: ember`, `Swatinem/rust-cache` `workspaces: ember`, and artifact paths `ember/dist/Ember.dmg`, `ember/bench.txt`, `ember/shot-*.png`. Nested `ember/.github` removed.
-- Target: Apple Silicon only (macos-14 runner is arm64). Local validation: core tests pass, ember-cli builds, `bench` runs. ember-app (GPUI/Metal) compile only verifiable on the Mac runner.
+- Target: Apple Silicon only (`macos-15` runner, arm64; `macos-14` was retired by GitHub on 2026-11-02). Local validation: core tests pass, ember-cli builds, `bench` runs. ember-app (GPUI/Metal) compile only verifiable on the Mac runner.
 - Note: `ember/Cargo.lock` is untracked; committing it improves build reproducibility.
 
 ## Backlog
